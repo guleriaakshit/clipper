@@ -1,6 +1,6 @@
 ---
 name: clip
-description: Run Clipper on a stream (a past Twitch, YouTube or Kick VOD, or a Twitch/YouTube stream that's live now) to find chat spikes, cut those moments into clips, write what happens and why each could do well as a Short, and open the editor dashboard. Use when the user says /clip, gives a stream or VOD link to clip, or asks for clips from a stream.
+description: Run Clipper on a stream (a past Twitch, YouTube or Kick VOD, or a Twitch, YouTube or Kick stream that's live now) to find chat spikes, cut those moments into clips, write what happens and why each could do well as a Short, and open the editor dashboard. Use when the user says /clip, gives a stream or VOD link to clip, or asks for clips from a stream.
 ---
 
 # /clip <url> [top N]
@@ -11,8 +11,8 @@ Clipper is installed where the `clipper` command points (`readlink -f "$(command
    `curl -fsSL https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.sh | bash` and stop.
 2. **Start the job** (in the background, it can take a while):
    - Past stream: `clipper analyze "<url>" --top <N, default 10>`. Ask what to clip on if the user hasn't said: `--by chat` (default), `speech` (what's said, from YouTube's own subtitles; Twitch/Kick VODs have none), `audio` (streamer gets loud, live streams only), or a mix like `--by chat,audio`; `--words "no way,clip that"` adds phrases to listen for. `--min-score <0-100, default 85>` keeps only strong clips; if none pass, report the best score Clipper found and offer to lower it.
-     Kick VODs need an exported chat file (`--chat-file <path>`): Kick's chat API sits behind Cloudflare's bot check. Members-only or age-gated videos: add `--cookies-from-browser chrome` (ask which browser).
-   - Live now (a `twitch.tv/<channel>` link or a live YouTube link): `clipper live "<url>" --hours <how long, default 6>`. Clips appear as chat spikes calm down; stop with `clipper stop <job>`.
+     Kick VOD chat is read automatically (long VODs take a few minutes). Members-only or age-gated videos: add `--cookies-from-browser chrome` (ask which browser).
+   - Live now (a `twitch.tv/<channel>` or `kick.com/<channel>` link, or a live YouTube link): `clipper live "<url>" --hours <how long, default 6>`. Clips appear as chat spikes calm down; stop with `clipper stop <job>`.
    - Start the dashboard too: `clipper serve` (background) and give the user http://localhost:8765.
 3. **Write what + why** once `jobs/<job>/clips.json` exists in the install folder. For each clip read `sample_chat`, `signals`, `top_words`, `multiple` and, if downloaded, `jobs/<job>/clips/<n>/words.json` (what the streamer said).
    - `what`: one plain sentence on what happens, built only from the chat and the transcript. If it's unclear, say so. Never invent events, names or game details.

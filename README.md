@@ -2,7 +2,7 @@
 
 Clipper finds the moments in a stream where chat lost it, cuts them out in the best quality available, and turns them into vertical Shorts.
 
-It works on **past streams** (Twitch VODs, YouTube streams, Kick VODs) and on **streams that are live right now** (Twitch channels, live YouTube streams).
+It works on **Twitch, YouTube and Kick**, both on **past streams** (VODs) and on **streams that are live right now**.
 
 You choose how clips are found, one way or several at once:
 
@@ -44,7 +44,7 @@ To install without questions, add `--yes` (`... | bash -s -- --yes`). To update,
 clipper serve                                   # dashboard at http://localhost:8765
 clipper analyze https://www.twitch.tv/videos/…  # a past stream, found by chat spikes
 clipper analyze <link> --by chat,speech --words "no way,clip that" --min-score 80   # chat + what's said, keep 80+
-clipper live https://www.twitch.tv/somechannel  # a stream that's live now (Ctrl+C or `clipper stop <job>` to stop)
+clipper live https://kick.com/somechannel      # a stream that's live now (Twitch, YouTube or Kick; `clipper stop <job>` to stop)
 clipper render <job> <clip number>              # render a Short from the terminal
 clipper list                                    # every stream you've clipped
 clipper stt-download                            # add speech-to-text later
@@ -56,7 +56,8 @@ You can also paste any of these links straight into the dashboard.
 
 - **Twitch:** chat comes from Twitch's public web API. No login is needed.
 - **YouTube:** chat comes from the video's chat replay, which must have been on during the stream.
-- **Kick:** Kick's chat history sits behind Cloudflare's bot check, so Clipper doesn't read it. Export the chat with another tool and add it with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns.
+- **Kick:** chat comes from Kick's chat replay, the same public endpoint kick.com uses for logged-out visitors. A long VOD is read in parallel ten-minute parts: a 9.6-hour stream with 27,000 messages took about 6 minutes. If Kick ever asks for a bot check, Clipper stops instead of trying to get around it.
+- **Any platform:** you can also add an exported chat file with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns.
 - **Members-only or age-gated videos:** use `--cookies-from-browser chrome` (or safari, firefox, brave, edge).
 
 Clipper downloads only the clips themselves, in the best resolution and then the highest frame rate available.
@@ -65,11 +66,11 @@ Clipper downloads only the clips themselves, in the best resolution and then the
 
 Clipper watches the stream as it happens:
 
-- It reads chat live: Twitch through its public chat server, read-only and without a login; YouTube through yt-dlp.
+- It reads chat live: Twitch through its public chat server, read-only and without a login; YouTube through yt-dlp; Kick through Kick's realtime chat service with an anonymous token.
 - It records the video into a rolling 10-minute buffer.
 - It cuts each spike into a clip once chat calms down.
 
-Times count from when Clipper started watching. It stops when you press **Stop watching**, when the stream ends, or after the number of hours set under *More options* (6 by default). Kick live streams aren't supported, for the same Cloudflare reason as above.
+Times count from when Clipper started watching. It stops when you press **Stop watching**, when the stream ends, or after the number of hours set under *More options* (6 by default).
 
 ### Making a Short
 
@@ -84,6 +85,7 @@ Open a clip, go to **Make the Short**, frame the face cam and the gameplay, and 
 | YouTube's own subtitles for past streams | `clipper/captions.py` |
 | Clip window: starts 20 s before chat reacts and ends after chat calms down (20–60 s) | `clipper/spikes.py` |
 | Download only that part (`yt-dlp --download-sections`) | `clipper/download.py` |
+| Chat for each platform (Twitch, YouTube, Kick, chat files) | `clipper/chat/` |
 | Live: chat readers, rolling recorder, cutting | `clipper/live.py` |
 | Hottest moment: the loudest 3 s just before chat peaks | `clipper/hotspot.py` |
 | Word timings (Parakeet through sherpa-onnx) | `clipper/stt.py`, `clipper/subs.py` |

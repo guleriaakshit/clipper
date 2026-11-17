@@ -7,7 +7,7 @@ One watcher process per stream (`clipper live <url>`, started by the dashboard):
 - every CHECK_S seconds the same spike scoring as for past streams (spikes.analyse) runs on the chat so far;
   each spike that has calmed down is cut from the buffer into clips/<n>/source.mp4 and prepared like any clip.
 Times count from when watching started. Stop with the dashboard's Stop button, `clipper stop <job>`, or when
-the stream ends. Kick isn't supported live: its chat sits behind Cloudflare's bot check.
+the stream ends. Kick live chat comes from Kick's realtime service with an anonymous token (chat/kick.py).
 """
 import json
 import os
@@ -61,9 +61,19 @@ def probe(url):
             raise NotLive(f"Couldn't open {ch} on Twitch: {e}")
         return {"platform": "twitch", "id": ch, "url": f"https://www.twitch.tv/{ch}", "channel": j.get("uploader") or ch,
                 "title": j.get("description") or j.get("title") or ch}
-    if KICK_CH.search(url) and "/videos/" not in url and "/video/" not in url:
-        raise NotLive("Kick live streams can't be clipped: Kick's chat sits behind Cloudflare's bot check. "
-                      "Clip the VOD afterwards with an exported chat file instead.")
+    m = KICK_CH.search(url)
+    if m and "/videos/" not in url and "/video/" not in url:
+        from .chat import kick
+        slug = m.group(1).lower()
+        try:
+            ch = kick.channel(slug)
+        except Exception as e:
+            raise NotLive(f"Couldn't open {slug} on Kick: {e}")
+        ls = ch.get("livestream")
+        if not ls or not ls.get("is_live", True):
+            raise NotLive(f"{slug} isn't live on Kick right now.")
+        return {"platform": "kick", "id": slug, "url": f"https://kick.com/{slug}",
+                "channel": (ch.get("user") or {}).get("username") or slug, "title": ls.get("session_title") or slug}
     if YOUTUBE.search(url):
         j = _ytdlp_json(url)
         status = j.get("live_status")
@@ -292,6 +302,10 @@ def run(key):
     chat = Chat(t0)
     if job["platform"] == "twitch":
         reader = threading.Thread(target=twitch_chat, args=(job["id"], chat, stop_evt), daemon=True)
+    elif job["platform"] == "kick":
+        from .chat import kick
+        reader = threading.Thread(target=kick.live, args=(job["id"], chat.add, stop_evt,
+                                                          lambda e: setattr(chat, "error", e)), daemon=True)
     else:
         reader = threading.Thread(target=youtube_chat, args=(job["url"], jd, chat, stop_evt), daemon=True)
     reader.start()

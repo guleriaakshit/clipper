@@ -1,4 +1,5 @@
 """Download only the clip's time range, best resolution and highest frame rate."""
+import re
 import subprocess
 from pathlib import Path
 
@@ -8,8 +9,21 @@ from .common import TMP, video_info
 SORT = "res,fps,vbr,abr"
 
 
+def _source(url):
+    """yt-dlp's Kick VOD reader can lag behind Kick; Kick's own video data gives the HLS playlist directly."""
+    m = re.search(r"kick\.com/.*?([0-9a-f]{8}-[0-9a-f-]{27})", url)
+    if m:
+        from .chat import kick
+        try:
+            return kick.video(m.group(1)).get("source") or url
+        except Exception:
+            return url
+    return url
+
+
 def section(url, start, end, out_dir: Path, cookies_browser=None):
     out_dir.mkdir(parents=True, exist_ok=True)
+    url = _source(url)
     for old in out_dir.glob("source.*"):
         old.unlink()
     cmd = ["yt-dlp", "--no-warnings", "--no-playlist",
