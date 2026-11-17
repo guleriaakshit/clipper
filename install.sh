@@ -4,7 +4,7 @@
 # or, inside a clone:  ./install.sh
 # Options: --yes (take every default, no questions).
 # Env: CLIPPER_DIR (install folder), CLIPPER_REPO (git URL), CLIPPER_STT_MODEL (existing model folder),
-#      CLIPPER_SKIP (comma list of: stt,renderer,command,skill,open) for unattended installs.
+#      CLIPPER_SKIP (comma list of: stt,stt-hq,renderer,command,skill,open) for unattended installs.
 set -euo pipefail
 
 REPO="${CLIPPER_REPO:-https://github.com/guleriaakshit/clipper.git}"
@@ -130,12 +130,13 @@ fi
 # ---------------------------------------------------------------- choices
 CONF_STT=""
 step "4. Speech-to-text (word-by-word subtitles)"
-say "  ${dim}Clipper writes one-word subtitles from what the streamer says, using NVIDIA Parakeet locally (offline, free).${off}"
-say "  ${dim}The model is a ~490 MB download (~640 MB on disk). Without it, Shorts have no subtitles; everything else works.${off}"
+say "  ${dim}Clipper uses a stream's own subtitles when it has them (YouTube). When it doesn't (Twitch, Kick, live), it${off}"
+say "  ${dim}transcribes on this computer, offline and free: NVIDIA Parakeet TDT 0.6B v2 (~480 MB download).${off}"
+say "  ${dim}Without it, Twitch and Kick clips get no subtitles; everything else works.${off}"
 if ! skipped stt && ask "Set up speech-to-text?" y; then
   "${PIP[@]}" "sherpa-onnx>=1.12" && ok "sherpa-onnx installed"
   EXISTING="${CLIPPER_STT_MODEL:-}"
-  [ -z "$EXISTING" ] && EXISTING="$(askval "Already have the Parakeet TDT 0.6B v3 int8 model folder? Path, or Enter to download:" "")"
+  [ -z "$EXISTING" ] && EXISTING="$(askval "Already have a Parakeet TDT 0.6B (v2 or v3) int8 model folder? Path, or Enter to download:" "")"
   EXISTING="${EXISTING/#\~/$HOME}"
   if [ -n "$EXISTING" ] && [ -f "$EXISTING/encoder.int8.onnx" ] && [ -f "$EXISTING/tokens.txt" ]; then
     CONF_STT="$EXISTING"; ok "Using the model in $EXISTING"
@@ -145,6 +146,20 @@ if ! skipped stt && ask "Set up speech-to-text?" y; then
   fi
 else
   say "  Skipped. Add it later with: clipper stt-download (after: .venv/bin/pip install sherpa-onnx)"
+fi
+
+step "4b. Better speech-to-text for past streams (NVIDIA GPU)"
+GPU="$(command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+if [ -z "$GPU" ]; then
+  say "  ${dim}No NVIDIA GPU found: past streams use Parakeet too.${off}"
+else
+  say "  ${dim}Found $GPU. Past streams don't need real-time speed, so Clipper can use Qwen3-ASR 1.7B on the GPU instead:${off}"
+  say "  ${dim}more accurate, with punctuation. It needs its own Python environment with PyTorch (~9 GB in all, 6+ GB of GPU memory).${off}"
+  if ! skipped stt-hq && ask "Set up the GPU model?" y; then
+    .venv/bin/python -m clipper stt-hq && ok "GPU speech-to-text ready" || warn "GPU setup failed; past streams use Parakeet. Try later with: clipper stt-hq"
+  else
+    say "  Skipped. Add it later with: clipper stt-hq"
+  fi
 fi
 
 step "5. Short renderer (Remotion)"

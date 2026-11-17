@@ -1,8 +1,9 @@
-"""A published stream's own auto-generated subtitles (YouTube), so Clipper never has to listen to or transcribe it.
+"""A published stream's own subtitles, fetched first on every platform: speech-to-text (stt.py) only runs when
+there are none.
 
-YouTube's auto-captions (json3) carry a time for every word. Twitch and Kick VODs have no subtitles: there,
-"what's said" isn't available for the whole stream, and only the short clips themselves get transcribed for
-the Short's subtitles (stt.py).
+YouTube's auto-captions (json3) carry a time for every word; uploaded subtitles (json3 or WebVTT, any platform
+yt-dlp finds them on) time whole lines, and their words are spread over the line. Twitch and Kick VODs normally
+have none, so those get transcribed.
 """
 import json
 import re
@@ -16,8 +17,6 @@ _MARK = re.compile(r"^(\[.*\]|>>+|-)$")
 
 def fetch(url, workdir: Path, platform: str, cookies_browser=None):
     """[{"text", "start", "end"}] for the whole stream, or None when the platform has no subtitles for it."""
-    if platform != "youtube":
-        return None
     cached = workdir / "captions.json"
     if cached.exists():
         return read_json(cached) or None
@@ -33,20 +32,53 @@ def fetch(url, workdir: Path, platform: str, cookies_browser=None):
     picks = [("--write-auto-subs", k) for k in (f"{lang}-orig", f"{short}-orig", lang, short) if k in auto]
     picks += [("--write-subs", k) for k in (lang, short) if k in manual]
     picks += [("--write-subs", k) for k in manual if k.startswith(short)]
+    if not picks and manual:                       # the stream's language isn't given: any uploaded subtitles
+        picks = [("--write-subs", k) for k in manual][:2]
     for flag, code in picks[:3]:
-        for f in workdir.glob("captions.*.json3"):
+        for f in list(workdir.glob("captions.*.json3")) + list(workdir.glob("captions.*.vtt")):
             f.unlink()
-        subprocess.run(base + [flag, "--sub-langs", code, "--sub-format", "json3", "-o", str(workdir / "captions"), url],
-                       capture_output=True, text=True, timeout=300)
-        files = list(workdir.glob("captions.*.json3"))
+        subprocess.run(base + [flag, "--sub-langs", code, "--sub-format", "json3/vtt/best", "-o",
+                               str(workdir / "captions"), url], capture_output=True, text=True, timeout=300)
+        files = list(workdir.glob("captions.*.json3")) + list(workdir.glob("captions.*.vtt"))
         if files:
-            words = parse_json3(files[0])
+            words = parse_json3(files[0]) if files[0].suffix == ".json3" else parse_vtt(files[0])
             for f in files:
                 f.unlink()
             if words:
                 write_json(cached, words)
                 return words
     return None
+
+
+def _vtt_time(s):
+    secs = 0.0
+    for x in s.strip().replace(",", ".").split(":"):
+        secs = secs * 60 + float(x)
+    return secs
+
+
+def parse_vtt(path):
+    """WebVTT cues -> words spread evenly over each cue (repeated rolling lines are dropped)."""
+    out, last = [], ""
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    for block in re.split(r"\n\s*\n", text):
+        lines = [l for l in block.strip().splitlines() if l.strip()]
+        ti = next((i for i, l in enumerate(lines) if "-->" in l), None)
+        if ti is None:
+            continue
+        a, b = (x.split()[0] for x in lines[ti].split("-->"))
+        t0, t1 = _vtt_time(a), _vtt_time(b)
+        line = re.sub(r"<[^>]+>", "", " ".join(lines[ti + 1:])).strip()
+        if not line or line == last:
+            continue
+        new = line[len(last):].strip() if last and line.startswith(last) else line
+        last = line
+        ws = [w for w in new.split() if not _MARK.match(w)]
+        for k, w in enumerate(ws):
+            out.append({"text": w, "start": round(t0 + (t1 - t0) * k / len(ws), 3),
+                        "end": round(t0 + (t1 - t0) * (k + 1) / len(ws), 3)})
+    out.sort(key=lambda w: w["start"])
+    return out
 
 
 def parse_json3(path):

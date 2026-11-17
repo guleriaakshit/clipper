@@ -29,6 +29,9 @@ def main():
     a.add_argument("--by", default="chat", help="comma list of chat, audio, speech (default chat)")
     a.add_argument("--words", default="", help="words to listen for, comma separated (with --by speech)")
     a.add_argument("--min-score", type=int, default=85, help="only keep clips scoring at least this (0-100, default 85)")
+    a.add_argument("--chat-x", type=float, default=2.0, help="chat spike = at least this many times its average rate (default 2)")
+    a.add_argument("--loud-x", type=float, default=2.0,
+                   help="loud voice = at least this many times the streamer's usual level (default 2 = +6 dB)")
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8765)
     r = sub.add_parser("render")
@@ -41,11 +44,14 @@ def main():
     lv.add_argument("--by", default="chat")
     lv.add_argument("--words", default="")
     lv.add_argument("--min-score", type=int, default=85)
+    lv.add_argument("--chat-x", type=float, default=2.0)
+    lv.add_argument("--loud-x", type=float, default=2.0)
     lr = sub.add_parser("live-run")
     lr.add_argument("key")
     st = sub.add_parser("stop")
     st.add_argument("key")
-    sub.add_parser("stt-download")
+    sub.add_parser("stt-download", help="download Parakeet v2 (live streams, and past streams without a GPU)")
+    sub.add_parser("stt-hq", help="set up Qwen3-ASR on the NVIDIA GPU for past streams (~9 GB)")
     sub.add_parser("update")
     b = sub.add_parser("brief")
     b.add_argument("key")
@@ -70,7 +76,8 @@ def main():
         from .pipeline import analyze
         jd = analyze(args.url, top_n=args.top, cookies_browser=args.cookies_from_browser,
                      chat_file=args.chat_file, skip_download=args.no_download,
-                     basis=args.by.split(","), keywords=args.words, min_score=args.min_score)
+                     basis=args.by.split(","), keywords=args.words, min_score=args.min_score, chat_x=args.chat_x,
+                     loud_x=args.loud_x)
         c = read_json(jd / "clips.json")
         print(f"job: {jd.name}  messages: {c['messages']}  average: {c['avg_per_min']}/min  minimum score: {c.get('min_score')}")
         if not c["clips"]:
@@ -90,7 +97,7 @@ def main():
         if not target:
             raise SystemExit("That link isn't live right now. For a past stream use: clipper analyze <url>")
         jd = live.new_job(target, hours=args.hours, basis=args.by.split(","), keywords=args.words,
-                          min_score=args.min_score)
+                          min_score=args.min_score, chat_x=args.chat_x, loud_x=args.loud_x)
         print(f"Watching {target['channel']} live. Job: {jd.name}. Ctrl+C or `clipper stop {jd.name}` to stop.")
         try:
             live.run(jd.name)
@@ -106,10 +113,16 @@ def main():
         print("Stopping", args.key)
     elif args.cmd == "stt-download":
         from . import stt
-        if stt.available():
+        if stt.available() and stt.model_dir().name == stt.NAME:
             print("Speech-to-text model already installed at", stt.model_dir())
         else:
             print("Installed at", stt.download())
+    elif args.cmd == "stt-hq":
+        from . import stt
+        try:
+            stt.hq_install()
+        except Exception as e:
+            raise SystemExit(f"Couldn't set up the GPU speech-to-text: {e}")
     elif args.cmd == "update":
         from .update import update
         update()

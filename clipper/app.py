@@ -54,11 +54,31 @@ def clip_status(key, c):
 PLATFORM = {"twitch": "Twitch", "youtube": "YouTube", "kick": "Kick"}
 
 
+STEP_STATE = {"done": "Done", "skip": "Skipped", "wait": "Waiting", "failed": "Stopped here"}
+
+
+def steps_html(st):
+    """One bar per step of the analysis (chat, subtitles, audio download, transcription, moments, clips)."""
+    pct = max(0.0, min(100.0, float(st.get("pct") or 0)))
+    rows = []
+    for s in st.get("steps") or []:
+        state = s.get("state", "wait")
+        if state == "skip" and not s.get("msg"):
+            continue                                   # not part of this run
+        p = 100.0 if state == "done" else float(s.get("pct") or 0) if state in ("run", "failed") else 0.0
+        right = f"{p:.0f}%" if state == "run" else STEP_STATE.get(state, "")
+        msg = f'<p>{esc(s["msg"])}</p>' if s.get("msg") else ""
+        rows.append(f'<div class="np-step st-{state}"><div class="np-run-line"><b>{esc(s["label"])}</b>'
+                    f'<span>{right}</span></div><div class="np-bar"><i style="width:{p:.1f}%"></i></div>{msg}</div>')
+    return (f'<div class="np-run np-steps"><div class="np-run-line np-overall"><b>Overall</b><span>{pct:.0f}%</span></div>'
+            f'<div class="np-bar np-bar-big"><i style="width:{pct:.1f}%"></i></div>{"".join(rows)}</div>')
+
+
 def status_html(key):
     if not key:
         return ('<div class="np-status np-empty"><h2>No stream yet</h2>'
-                '<p>Paste a past-stream link above and press <b>Find clips</b>. Clipper reads the chat replay, '
-                'finds where it spiked and downloads only those parts.</p></div>')
+                '<p>Paste a stream link above and press <b>Find clips</b>. Clipper reads the chat replay (and, if you '
+                'pick them, listens to the streamer), finds the moments and downloads only those parts.</p></div>')
     st = read_json(JOBS / key / "status.json", {}) or {}
     s = read_json(JOBS / key / "clips.json", {}) or {}
     job = read_json(JOBS / key / "job.json", {}) or {}
@@ -68,7 +88,7 @@ def status_html(key):
     head = f'<div class="np-st-title"><h2>{title}</h2>' + (f"<p>{sub}</p>" if sub else "") + "</div>"
     if st.get("error"):
         return (f'<div class="np-status">{head}<div class="np-note np-err"><b>This stream stopped.</b> '
-                f'{esc(st["error"])}</div></div>')
+                f'{esc(st["error"])}</div>' + (steps_html(st) if st.get("steps") else "") + '</div>')
     stage = (st.get("stage") or "").lower()
     if job.get("live"):
         on = live.running(JOBS / key)
@@ -82,6 +102,8 @@ def status_html(key):
         head = head.replace("<h2>", f"<h2>{badge}", 1)
         return (f'<div class="np-status">{head}<dl class="np-stats">{dl}</dl>'
                 f'<p class="np-livemsg">{esc(st.get("msg") or "")}</p></div>')
+    if stage and stage != "done" and st.get("steps"):
+        return f'<div class="np-status">{head}{steps_html(st)}</div>'
     if stage and stage != "done":
         pct = max(0.0, min(100.0, float(st.get("pct") or 0)))
         return (f'<div class="np-status">{head}<div class="np-run"><div class="np-run-line">'
@@ -93,6 +115,10 @@ def status_html(key):
     stats.append(("Looked for", "<span class='np-by'>" + " + ".join(signals.NAMES[x] for x in basis) + "</span>"))
     if s.get("min_score") is not None:
         stats.append(("Minimum score", str(s["min_score"])))
+    if "chat" in basis and s.get("chat_x"):
+        stats.append(("Chat spike", f"{s['chat_x']:g}x<small> average or more</small>"))
+    if "audio" in basis and s.get("loud_x"):
+        stats.append(("Loud voice", f"{s['loud_x']:g}x<small> usual or more</small>"))
     if s.get("messages"):
         stats.append(("Chat messages", f"{s['messages']:,}"))
     if s.get("avg_per_min") is not None:
@@ -438,7 +464,7 @@ def boxes(frame, e):
 
 
 # ---------------- actions ----------------
-def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords, min_score):
+def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords, min_score, chat_x=2.0, loud_x=2.0):
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or [])]
     if not basis:
         raise gr.Error("Pick at least one way to find clips: chat spikes, loud voice or what's said.")
@@ -448,14 +474,20 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords, min_s
         raise gr.Error(str(e))
     except Exception as e:
         raise gr.Error(f"Couldn't check that link: {e}")
-    if target and "speech" in basis and not stt.available():
+    if target and "speech" in basis and not stt.can_transcribe():
         raise gr.Error("Live streams are transcribed on your computer, which needs the speech-to-text model. "
                        "In a terminal run: clipper stt-download")
-    if not target and basis == ["audio"]:
-        raise gr.Error("Loud voice works on live streams only. For a past stream, pick chat spikes or what's said.")
+    if not target and "speech" in basis and not stt.can_transcribe(past=True):
+        try:
+            plat = detect(url or "")[0]
+        except ValueError:
+            plat = ""
+        if plat != "youtube":     # YouTube usually has its own subtitles; others are transcribed here
+            raise gr.Error("This stream has no subtitles of its own, so Clipper transcribes it on your computer, which "
+                           "needs the speech-to-text model. In a terminal run: clipper stt-download")
     if target:
         jd = live.new_job(target, hours=float(hours or 6), basis=basis, keywords=keywords or "",
-                          min_score=int(min_score))
+                          min_score=int(min_score), chat_x=float(chat_x), loud_x=float(loud_x))
         live.start_process(jd)
         gr.Info(f"Watching {target.get('channel') or target['id']} live. Clips appear as chat spikes.")
         return jd.name
@@ -479,7 +511,8 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords, min_s
         with LOCK:
             try:
                 pipeline.analyze(url, top_n=int(top_n), cookies_browser=cookies or None, chat_file=cf, basis=basis,
-                                 keywords=keywords or "", min_score=int(min_score))
+                                 keywords=keywords or "", min_score=int(min_score), chat_x=float(chat_x),
+                                 loud_x=float(loud_x))
             except Exception:
                 pass                       # the error is in status.json
     threading.Thread(target=work, daemon=True).start()
@@ -831,10 +864,26 @@ footer { display: none !important; }
 .np-hide { display: none !important; }
 button, [role="button"], .np-open, .sb-open, label.np-tick { cursor: pointer; }
 
+/* no visible scrollbars anywhere; everything still scrolls with the wheel, touchpad or touch */
+* { scrollbar-width: none !important; -ms-overflow-style: none !important; }
+*::-webkit-scrollbar { display: none !important; width: 0 !important; height: 0 !important; }
+
 /* ---------- shell: sidebar + main ---------- */
 #np-shell { gap: 20px; align-items: flex-start; flex-wrap: nowrap; }
 #np-side { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; gap: 10px; flex-wrap: nowrap !important;
   background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r-lg); padding: 18px 16px 16px !important; }
+/* chat file drop box: label on its own line, a compact drop area under it */
+#np-chatfile { padding: 0 !important; }
+#np-chatfile > label, #np-chatfile [data-testid="block-label"] { position: static !important; margin: 0 0 6px !important; border: 0 !important;
+  background: transparent !important; box-shadow: none !important; padding: 0 !important; font-size: 13.5px; white-space: normal !important; }
+#np-chatfile button, #np-chatfile .wrap { min-height: 96px !important; height: auto !important; }
+#np-chatfile .wrap { padding: 10px !important; font-size: 13px !important; gap: 2px !important; }
+#np-chatfile .icon-wrap, #np-chatfile svg { width: 20px !important; height: 20px !important; }
+/* the sidebar is capped at the window height: its parts keep their size and the sidebar scrolls, instead of
+   being squashed (which cut off the link box and made the form wrap sideways into a scrolling strip) */
+#np-side > * { flex-shrink: 0 !important; }
+#np-side .form { flex-wrap: nowrap !important; overflow: visible !important; }
+#np-opts > div { max-height: none !important; overflow: visible !important; }
 #np-main { gap: 16px; min-width: 0; }
 @media (max-width: 980px) {
   #np-shell { flex-wrap: wrap; }
@@ -910,6 +959,16 @@ label.np-tick { display: grid; place-items: center; width: 36px; min-height: 36p
 .np-bar { height: 6px; background: var(--sunk); border: 1px solid var(--rule); border-radius: 99px; overflow: hidden; }
 .np-bar i { display: block; height: 100%; background: var(--ink); }
 .np-run p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+/* analysis steps */
+.np-steps { display: grid; gap: 12px; }
+.np-overall b { font-size: 15px; }
+.np-bar-big { height: 9px; margin-bottom: 4px; }
+.np-step .np-run-line { margin-bottom: 4px; font-size: 13.5px; }
+.np-step p { margin: 5px 0 0; font-size: 13px; }
+.np-step.st-wait, .np-step.st-skip { opacity: .55; }
+.np-step.st-done .np-bar i { background: var(--ok); }
+.np-step.st-run .np-run-line b::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--heat); margin-right: 7px; vertical-align: 1px; }
+.np-step.st-failed .np-bar i { background: var(--heat); }
 
 /* notes */
 .np-note { margin: 14px 0 0; padding: 10px 14px; border-radius: var(--r-md); background: var(--sunk); border: 1px solid var(--rule); font-size: 14px; line-height: 1.5; color: var(--ink); }
@@ -1129,14 +1188,21 @@ def build():
                         'and cuts those moments into vertical Shorts.</p></div>', js_on_load=None)
                 url = gr.Textbox(label="Stream link", show_label=False, container=False, elem_id="np-url", lines=1,
                                  max_lines=1, placeholder="Paste a past VOD or a live channel")
-                by_opts = [("Chat spikes", "chat"), ("Streamer gets loud (live streams)", "audio"),
-                           ("What's said (subtitles)", "speech")]
+                by_opts = [("Chat spikes", "chat"), ("Streamer gets loud", "audio"), ("What's said", "speech")]
                 basis = gr.CheckboxGroup(by_opts, value=["chat"], label="Find clips by", elem_id="np-basis",
-                                         info="Tick one or more; moments where several agree rank higher. Past "
-                                              "streams use YouTube's own subtitles (Twitch and Kick VODs have none) "
-                                              "and are never listened to. Live streams are listened to on your computer.")
+                                         info="Tick one or more; moments where several agree rank higher. Loud voice "
+                                              "and what's said listen to the stream on your computer: a past stream's "
+                                              "audio is downloaded first, and it's transcribed unless the platform has "
+                                              "its own subtitles (YouTube). That takes a while on long streams.")
                 keywords = gr.Textbox(label="Words to listen for (optional)", visible=False, elem_id="np-words",
                                       placeholder="no way, let's go, clip that", lines=1, max_lines=2)
+                chat_x = gr.Slider(1.5, 10, value=2, step=0.5, label="Chat spike: at least this many times its average",
+                                   info="2 = chat is twice as busy as usual. Higher keeps only the biggest reactions.",
+                                   elem_id="np-chatx")
+                loud_x = gr.Slider(1.5, 6, value=2, step=0.5, visible=False, elem_id="np-loudx",
+                                   label="Loud voice: at least this many times their usual level",
+                                   info="Clipper measures how loud the streamer normally talks across the whole stream. "
+                                        "2 = twice that (+6 dB), 3 = +9.5 dB, 4 = +12 dB.")
                 min_score = gr.Slider(0, 100, value=85, step=1, label="Minimum score",
                                       info="Clips scoring lower are left out, so you only get strong ones.",
                                       elem_id="np-minscore")
@@ -1148,7 +1214,7 @@ def build():
                                            ("Firefox", "firefox"), ("Brave", "brave"), ("Edge", "edge")], value="",
                                           label="Sign in with browser cookies (members-only or age-gated)")
                     chat_file = gr.File(label="Chat file (exported Twitch or Kick chat, JSON or CSV)",
-                                        file_types=[".json", ".csv"], height=100)
+                                        file_types=[".json", ".csv"], elem_id="np-chatfile")
                 side = gr.HTML(sidebar_html(first), js_on_load=PICK_JS)
 
             # ---------- main ----------
@@ -1249,8 +1315,10 @@ def build():
         ask_out = [pend_kind, pend_ids, modal, modal_msg]
 
         # streams
-        basis.change(lambda b: gr.update(visible="speech" in (b or [])), basis, keywords, **quiet)
-        go.click(start_analysis, [url, top_n, cookies, chat_file, hours, basis, keywords, min_score], job).then(
+        basis.change(lambda b: (gr.update(visible="speech" in (b or [])), gr.update(visible="chat" in (b or [])),
+                                gr.update(visible="audio" in (b or []))), basis, [keywords, chat_x, loud_x], **quiet)
+        go.click(start_analysis, [url, top_n, cookies, chat_file, hours, basis, keywords, min_score, chat_x, loud_x],
+                 job).then(
             lambda k: refresh_job(k), job, head_out, **quiet)
         job.change(switch_job, job, head_out, **quiet)
         demo.load(first_load, job, head_out, **quiet)

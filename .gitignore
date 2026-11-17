@@ -4,6 +4,7 @@ tmp/
 models/
 config.json
 .venv/
+.venv-stt/
 __pycache__/
 *.egg-info/
 *.pyc

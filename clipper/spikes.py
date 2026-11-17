@@ -65,7 +65,8 @@ def _tokens(texts):
     return c
 
 
-def analyse(msgs, duration, top_n=10):
+def analyse(msgs, duration, top_n=10, spike_x=SPIKE_X):
+    """spike_x: chat must reach this many times the stream's average rate."""
     counts, smooth, avg = rate(msgs, duration)
     if avg <= 0:
         return {"bin": BIN, "avg": 0, "counts": [], "clips": []}
@@ -76,7 +77,7 @@ def analyse(msgs, duration, top_n=10):
                                   zip(np.searchsorted(times, np.arange(0, len(counts)) * BIN),
                                       np.searchsorted(times, np.arange(1, len(counts) + 1) * BIN))] or [1])
     cands = []
-    for a, b in _regions(smooth >= SPIKE_X * avg):
+    for a, b in _regions(smooth >= spike_x * avg):
         pk = a + int(np.argmax(smooth[a:b + 1]))
         r0, r1 = a * BIN, (b + 1) * BIN
         lo, hi = np.searchsorted(times, r0), np.searchsorted(times, r1)

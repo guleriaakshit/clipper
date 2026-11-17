@@ -1,7 +1,8 @@
 """What a clip can be found by. Any mix of three signals, chosen per stream:
 
-- chat:   chat runs at 2x the stream's average or more (spikes.py; needs the chat);
-- audio:  the streamer gets loud: a stretch at least 6 dB above their usual level over the last 10 minutes;
+- chat:   chat runs at chat_x times the stream's average rate or more (2x by default; spikes.py; needs the chat);
+- audio:  the streamer gets loud: their voice reaches loud_x times their usual level (2x = +6 dB by default). The usual
+          level is the median loudness of the whole stream (so far, when live), leaving out silence;
 - speech: what the streamer says: reaction phrases ("no way", "oh my god", "let's go"...) or words you ask for.
 
 Every signal becomes a 0-1 "excitement" value per 5 s bin, lined up on the moment itself (chat reacts about
@@ -19,7 +20,9 @@ from . import spikes
 BIN = spikes.BIN
 NAMES = {"chat": "Chat spikes", "audio": "Loud voice", "speech": "What's said"}
 CHAT_LAG_BINS = 2                 # chat reacts ~10 s after the moment
-AUDIO_DB = 6.0                    # loud = this many dB above the streamer's usual level
+CHAT_X = spikes.SPIKE_X           # default: chat at 2x its average
+LOUD_X = 2.0                      # default: voice at 2x its usual level (+6 dB)
+QUIET_DB = -55.0                  # bins quieter than this are silence, left out of the usual level
 SR = 16000
 REACT = re.compile(r"\b(oh my god|oh my gosh|no way|no no+|what the (?:hell|heck|fuck)|wtf|let'?s go+|holy (?:shit|crap|cow)|"
                    r"are you (?:kidding|serious)|bro+|dude|clip (?:that|it)|oh no|insane|crazy|unbelievable|"
@@ -69,35 +72,6 @@ class AudioScan:
             self._transcribe()
 
 
-def scan_url(url, duration, speech=False, cookies_browser=None, progress=lambda pct, msg: None):
-    """Download only the stream's audio and scan it on the fly (nothing is stored)."""
-    dl = ["yt-dlp", "--no-warnings", "--no-part", "-f", "ba/b", "-S", "+size,+br", "--concurrent-fragments", "8",
-          "-o", "-", url]
-    if cookies_browser:
-        dl[1:1] = ["--cookies-from-browser", cookies_browser]
-    p1 = subprocess.Popen(dl, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    p2 = subprocess.Popen(["ffmpeg", "-v", "error", "-i", "pipe:0", "-vn", "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"],
-                          stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    p1.stdout.close()
-    scan = AudioScan(speech=speech)
-    got, step = 0, SR * 4 * 10            # read 10 s at a time
-    total = max(1.0, float(duration or 0)) * SR * 4
-    while True:
-        chunk = p2.stdout.read(step)
-        if not chunk:
-            break
-        scan.feed(np.frombuffer(chunk[: len(chunk) // 4 * 4], np.float32))
-        got += len(chunk)
-        progress(min(99.0, got * 100 / total), f"{'Listening and transcribing' if speech else 'Listening'}: "
-                                               f"{int(got / (SR * 4) // 60)} of {int((duration or 0) // 60)} min")
-    scan.finish()
-    p2.wait()
-    p1.wait()
-    if not scan.db:
-        raise RuntimeError("Couldn't download this stream's audio.")
-    return scan
-
-
 def segment_audio(path):
     """16 kHz mono float32 samples of one recorded segment (live)."""
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(SR), "-f", "f32le", "-"],
@@ -111,17 +85,30 @@ def _fit(a, n, fill=0.0):
     return np.array(a + [fill] * (n - len(a)), float)
 
 
-def chat_excite(msgs, duration, n):
+def chat_excite(msgs, duration, n, chat_x=CHAT_X):
     counts, smooth, avg = spikes.rate(msgs, duration)
     x = _fit(smooth / avg if avg > 0 else smooth * 0, n + CHAT_LAG_BINS)[CHAT_LAG_BINS:]
-    return np.clip((x - 1) / 5, 0, 1), x >= spikes.SPIKE_X
+    return np.clip((x - 1) / 5, 0, 1), x >= chat_x
 
 
-def audio_excite(db, n):
+def usual_db(db):
+    """The streamer's usual voice level: median loudness of the stream, leaving out silence."""
+    d = np.asarray(db, float)
+    sound = d[d > QUIET_DB]
+    return float(np.median(sound)) if len(sound) else float(np.median(d)) if len(d) else -30.0
+
+
+def loud_factor(db_value, usual):
+    """How many times their usual level (amplitude): +6 dB = 2x, +9.5 dB = 3x, +12 dB = 4x."""
+    return 10 ** ((db_value - usual) / 20)
+
+
+def audio_excite(db, n, loud_x=LOUD_X):
     d = _fit(db, n, fill=-90.0)
-    base = spikes._rolling_median(d, int(600 / BIN))
-    above = d - base
-    return np.clip((above - 3) / 9, 0, 1), above >= AUDIO_DB, above
+    usual = usual_db(db)
+    above = d - usual
+    need = 20 * np.log10(max(1.01, loud_x))                 # dB above usual for loud_x
+    return np.clip((above - need / 2) / max(3.0, need), 0, 1), above >= need, 10 ** (above / 20)
 
 
 def speech_excite(words, n, keywords=""):
@@ -145,15 +132,21 @@ def speech_excite(words, n, keywords=""):
 
 
 # ---------------- moments ----------------
-def find(enabled, duration, msgs=None, db=None, words=None, keywords="", top_n=10, min_score=0):
-    """Moments scoring at least min_score, best first. res["below"] = the best one that didn't make it."""
+def find(enabled, duration, msgs=None, db=None, words=None, keywords="", top_n=10, min_score=0, chat_x=CHAT_X,
+         loud_x=LOUD_X):
+    """Moments scoring at least min_score, best first. res["below"] = the best one that didn't make it.
+    chat_x / loud_x: how many times its usual level chat / the streamer's voice must reach to count as a spike."""
     enabled = [s for s in ("chat", "audio", "speech") if s in (enabled or [])] or ["chat"]
+    chat_x, loud_x = float(chat_x or CHAT_X), float(loud_x or LOUD_X)
     if enabled == ["chat"]:
-        res = spikes.analyse(msgs, duration, top_n=10_000)
+        res = spikes.analyse(msgs, duration, top_n=10_000, spike_x=chat_x)
         for c in res["clips"]:
             c["basis"], c["sub"], c["said"], c["hot_ref"] = ["chat"], {"chat": c["score"]}, [], c["chat_peak"]
-        return _keep(res, min_score, top_n)
-    return _keep(_find(enabled, duration, msgs, db, words, keywords), min_score, top_n)
+        res = _keep(res, min_score, top_n)
+    else:
+        res = _keep(_find(enabled, duration, msgs, db, words, keywords, chat_x, loud_x), min_score, top_n)
+    res["chat_x"], res["loud_x"] = chat_x, loud_x
+    return res
 
 
 def _keep(res, min_score, top_n):
@@ -168,13 +161,13 @@ def _keep(res, min_score, top_n):
     return res
 
 
-def _find(enabled, duration, msgs, db, words, keywords):
+def _find(enabled, duration, msgs, db, words, keywords, chat_x=CHAT_X, loud_x=LOUD_X):
     n = int(np.ceil(duration / BIN)) or 1
-    E, T, said = {}, {}, [[] for _ in range(n)]
+    E, T, said, factor = {}, {}, [[] for _ in range(n)], None
     if "chat" in enabled and msgs:
-        E["chat"], T["chat"] = chat_excite(msgs, duration, n)
+        E["chat"], T["chat"] = chat_excite(msgs, duration, n, chat_x)
     if "audio" in enabled and db:
-        E["audio"], T["audio"], _ = audio_excite(db, n)
+        E["audio"], T["audio"], factor = audio_excite(db, n, loud_x)
     if "speech" in enabled and words:
         E["speech"], T["speech"], said = speech_excite(words, n, keywords)
     if not E:
@@ -199,7 +192,8 @@ def _find(enabled, duration, msgs, db, words, keywords):
             end = start + spikes.MAX_LEN
         phrases = [p for i in range(lo, hi) for p in said[i]] if said else []
         cands.append({"start": round(start, 2), "end": round(end, 2), "peak": pk * BIN + BIN / 2, "score": score,
-                      "basis": [s for s in E if T[s][a:b + 1].any()], "sub": sub, "said": list(dict.fromkeys(phrases))[:6]})
+                      "basis": [s for s in E if T[s][a:b + 1].any()], "sub": sub, "said": list(dict.fromkeys(phrases))[:6],
+                      "loud_x": round(float(factor[lo:hi].max()), 1) if factor is not None else None})
     cands.sort(key=lambda c: -c["score"])
     kept = []
     for c in cands:
@@ -214,6 +208,7 @@ def _find(enabled, duration, msgs, db, words, keywords):
         c.update(_chat_facts(msgs, times, smooth, avg, c))
         c["auto_reason"] = reason(c)
     return {"bin": BIN, "avg": float(avg), "avg_per_min": round(avg * 60 / BIN, 2) if avg else 0,
+            "usual_db": round(usual_db(db), 1) if db else None,
             "counts": [round(float(x), 2) for x in smooth] if msgs else [], "clips": kept}
 
 
@@ -247,7 +242,8 @@ def reason(c):
         parts.append(f'Chat hit {c["multiple"]}x its average ({c["peak_per_min"]:.0f} vs {c["avg_per_min"]:.0f} msgs/min) '
                      f'with {c["unique_chatters"]} different chatters.')
     if "audio" in c["basis"]:
-        parts.append(f'The streamer got loud (voice score {c["sub"].get("audio", 0)}/100).')
+        parts.append(f'The streamer got loud: {c["loud_x"]}x their usual voice level.' if c.get("loud_x")
+                     else f'The streamer got loud (voice score {c["sub"].get("audio", 0)}/100).')
     if c.get("said"):
         parts.append("They said: " + ", ".join(f'"{s}"' for s in c["said"][:4]) + ".")
     if c["top_words"]:

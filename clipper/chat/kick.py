@@ -15,7 +15,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
@@ -95,8 +95,9 @@ def meta_of(url, cookies_browser=None):
     return {"title": j.get("title"), "channel": j.get("uploader") or j.get("channel"), "duration": j.get("duration")}
 
 
-def _slice(channel_id, start, a, b):
-    """Messages with a <= t < b (seconds into the VOD), paging backwards from b."""
+def _slice(channel_id, start, a, b, seen=lambda covered, count: None):
+    """Messages with a <= t < b (seconds into the VOD), paging backwards from b. seen(seconds covered, messages)
+    reports how far it got, for the progress bar."""
     out, cursor, last = [], int((start + b) * 1e6), None
     while True:
         d = (_req("GET", f"https://kick.com/api/v2/channels/{channel_id}/messages?cursor={cursor}") or {}).get("data") or {}
@@ -110,6 +111,9 @@ def _slice(channel_id, start, a, b):
             if t < b:
                 out.append({"id": m.get("id"), "t": round(t, 2), "user": (m.get("sender") or {}).get("username", ""),
                             "text": _text(m.get("content"))})
+        if msgs:
+            oldest = min(_epoch(m["created_at"]) for m in msgs) - start
+            seen(max(0.0, min(b - a, b - oldest)), len(out))
         nxt = d.get("cursor")
         if stop or not nxt or (last is not None and int(nxt) >= last):
             return out
@@ -125,16 +129,30 @@ def fetch(url, vid, workdir, progress, cookies_browser=None):
     n = max(1, math.ceil(dur / SLICE_S))
     slices = [(i * SLICE_S, min(dur, (i + 1) * SLICE_S)) for i in range(n)]
     msgs, seen, done = [], set(), 0
+    covered, counts = [0.0] * n, [0] * n          # per part: seconds of chat read so far, messages so far
+
+    def note(i):
+        def f(sec, cnt):
+            covered[i], counts[i] = sec, cnt
+        return f
     progress(5, f"Downloading Kick chat replay (0 of {n} ten-minute parts)")
     with ThreadPoolExecutor(WORKERS) as pool:
-        futs = [pool.submit(_slice, v["channel_id"], v["start"], a, b) for a, b in slices]
-        for f in as_completed(futs):
-            for m in f.result():
-                if m["id"] not in seen:
-                    seen.add(m["id"])
-                    msgs.append({"t": m["t"], "user": m["user"], "text": m["text"]})
-            done += 1
-            progress(5 + 25 * done / n, f"Kick chat: {len(msgs):,} messages, {done} of {n} ten-minute parts")
+        futs = {pool.submit(_slice, v["channel_id"], v["start"], a, b, note(i)): i for i, (a, b) in enumerate(slices)}
+        pending = set(futs)
+        while pending:
+            finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for f in finished:
+                i = futs[f]
+                for m in f.result():
+                    if m["id"] not in seen:
+                        seen.add(m["id"])
+                        msgs.append({"t": m["t"], "user": m["user"], "text": m["text"]})
+                covered[i] = slices[i][1] - slices[i][0]
+                done += 1
+            frac = sum(covered) / max(1.0, dur)
+            got = len(msgs) + sum(counts[futs[f]] for f in pending)
+            progress(5 + 25 * frac, f"Kick chat: {got:,} messages, {int(sum(covered) // 60)} of {int(dur // 60)} min read "
+                                    f"({done} of {n} parts done)")
     msgs.sort(key=lambda m: m["t"])
     return msgs, {"title": v["title"], "channel": v["channel"], "duration": dur}
 

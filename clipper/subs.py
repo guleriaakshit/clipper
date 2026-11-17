@@ -4,8 +4,8 @@ import json
 from . import stt
 
 
-def words(src, out_json):
-    w = stt.words(src)
+def words(src, out_json, past=False):
+    w = stt.words(src, past=past)
     # clean: drop empties, cap each word's display at 0.9 s so silences stay empty
     out = []
     for x in w:
