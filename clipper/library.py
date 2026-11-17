@@ -1,13 +1,30 @@
-"""Delete streams and clips. Deleted files go to the system Trash (recoverable) when there is one, else they are
-removed. Remotion's hard links (remotion/public/clips/<job>-<n>.mp4) are removed with them."""
+"""Delete streams and clips. Deleted files go to the system Trash or Recycle Bin (recoverable) when there is one,
+else they are removed. Remotion's links (remotion/public/clips/<job>-<n>.mp4 and the <job>-<n>/ folder of memes and
+sounds) are removed with them."""
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
 from .common import JOBS, REMOTION, read_json, write_json
 
 TRASH = Path.home() / ".Trash"
+
+
+def can_trash() -> bool:
+    return os.name == "nt" or TRASH.is_dir()
+
+
+def _recycle(p: Path) -> bool:
+    """Windows: send to the Recycle Bin through .NET (no extra package). The path goes in an env var, never quoted."""
+    ps = ("Add-Type -AssemblyName Microsoft.VisualBasic; $p = $env:CLIPPER_RECYCLE; "
+          "if (Test-Path -LiteralPath $p -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory("
+          "$p, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
+          "$p, 'OnlyErrorDialogs', 'SendToRecycleBin') }")
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                       env={**os.environ, "CLIPPER_RECYCLE": str(p)})
+    return r.returncode == 0 and not p.exists()
 
 
 def size_of(p: Path) -> int:
@@ -47,6 +64,8 @@ def busy(key: str) -> str:
 def _discard(p: Path, label: str):
     if not p.exists():
         return
+    if os.name == "nt" and _recycle(p):
+        return
     if TRASH.is_dir() and os.access(TRASH, os.W_OK):
         dest = TRASH / f"{label} {time.strftime('%H.%M.%S')}"
         shutil.move(str(p), str(dest))
@@ -60,6 +79,9 @@ def _unlink_public(key: str, n=None):
     pub = REMOTION / "public" / "clips"
     for f in pub.glob(f"{key}-{n if n is not None else '*'}.mp4"):
         f.unlink(missing_ok=True)
+    for d in pub.glob(f"{key}-{n if n is not None else '*'}"):      # memes and sounds linked for effects
+        if d.is_dir() and d.name[len(key) + 1:].isdigit():
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def delete_streams(keys):

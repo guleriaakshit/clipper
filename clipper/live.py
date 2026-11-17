@@ -103,8 +103,11 @@ def start_process(jd: Path):
     """Run the watcher detached, so it keeps going if the dashboard restarts."""
     import sys
     log = open(jd / "live.log", "a")
+    # Windows: own process group and a hidden console (its yt-dlp and ffmpeg children share it, so no windows pop up)
+    detach = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW} if os.name == "nt"
+              else {"start_new_session": True})
     p = subprocess.Popen([sys.executable, "-m", "clipper", "live-run", jd.name], cwd=Path(__file__).resolve().parents[1],
-                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                         stdout=log, stderr=subprocess.STDOUT, **detach)
     write_json(jd / "live.json", {"pid": p.pid, "started": time.time()})
     return p.pid
 
@@ -114,6 +117,20 @@ def running(jd: Path) -> bool:
     pid = info.get("pid")
     if not pid or info.get("ended"):
         return False
+    return _alive(pid)
+
+
+def _alive(pid: int) -> bool:
+    if os.name == "nt":       # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259              # STILL_ACTIVE
     try:
         os.kill(pid, 0)
     except OSError:
@@ -124,7 +141,9 @@ def running(jd: Path) -> bool:
 def stop(jd: Path):
     (jd / "stop").touch()
     info = read_json(jd / "live.json", {}) or {}
-    if info.get("pid"):
+    # Windows has no SIGTERM (os.kill would hard-kill and orphan yt-dlp/ffmpeg): the watcher sees the stop file
+    # within CHECK_S seconds and shuts down cleanly.
+    if info.get("pid") and os.name != "nt":
         try:
             os.kill(info["pid"], signal.SIGTERM)
         except OSError:

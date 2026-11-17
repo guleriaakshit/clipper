@@ -31,6 +31,11 @@ def require_home():
     # keep every temp file (yt-dlp, ffmpeg, node, Chrome) in Clipper/tmp
     for k in ("TMPDIR", "TEMP", "TMP"):
         os.environ[k] = str(TMP)
+    # yt-dlp and other tools installed in the venv: on PATH even when the venv's python is run directly
+    bindir = str(Path(sys.executable).parent)
+    if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+    os.environ.setdefault("PYTHONUTF8", "1")      # child Pythons read and write UTF-8 (Windows defaults to cp1252)
     os.environ.setdefault("npm_config_cache", str(TMP / "npm-cache"))
     os.environ.setdefault("UV_CACHE_DIR", str(TMP / "uv-cache"))
 
@@ -45,18 +50,27 @@ def read_json(p, default=None):
     p = Path(p)
     if not p.exists():
         return default
-    return json.loads(p.read_text())
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def write_json(p, data):
     p = Path(p)
     tmp = p.with_suffix(p.suffix + ".part")
-    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
 
 
 def set_status(jd: Path, stage: str, pct: float = 0, msg: str = "", error: str = ""):
     write_json(jd / "status.json", {"stage": stage, "pct": round(pct, 1), "msg": msg, "error": error})
+
+
+WINDOWS = sys.platform == "win32"
+
+
+def tool(name: str) -> str:
+    """Full path of a command (on Windows npm/npx are .cmd files, which need the full path), else the name."""
+    import shutil
+    return shutil.which(name) or name
 
 
 def run(cmd, **kw):

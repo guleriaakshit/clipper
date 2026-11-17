@@ -5,7 +5,11 @@ clipper stop <job-key>
 clipper serve [--port 8765]
 clipper render <job-key> <clip-n>
 clipper list
-clipper stt-download"""
+clipper stt-download
+clipper update                                  pull the latest Clipper from GitHub
+clipper brief <job-key> <clip-n> [--open]       write the clip's hand-off for Claude (--open: start Claude Code on it)
+clipper meme search <words> [--kind videos|sounds|images]
+clipper meme get <job-key> <clip-n> <meme-id> [--top TEXT] [--bottom TEXT]"""
 import argparse
 import json
 
@@ -42,6 +46,24 @@ def main():
     st = sub.add_parser("stop")
     st.add_argument("key")
     sub.add_parser("stt-download")
+    sub.add_parser("update")
+    b = sub.add_parser("brief")
+    b.add_argument("key")
+    b.add_argument("n", type=int)
+    b.add_argument("--open", action="store_true", help="also open Claude Code on it in a new terminal")
+    m = sub.add_parser("meme")
+    msub = m.add_subparsers(dest="meme_cmd", required=True)
+    ms = msub.add_parser("search")
+    ms.add_argument("words", nargs="*")
+    ms.add_argument("--kind", choices=["videos", "sounds", "images"], default="videos")
+    ms.add_argument("--limit", type=int, default=15)
+    mg = msub.add_parser("get")
+    mg.add_argument("key")
+    mg.add_argument("n", type=int)
+    mg.add_argument("id", help="an id from `clipper meme search`, e.g. yt:abc123 or myinstants:vine-boom.mp3")
+    mg.add_argument("--name", default="")
+    mg.add_argument("--top", default="")
+    mg.add_argument("--bottom", default="")
     args = ap.parse_args()
 
     if args.cmd == "analyze":
@@ -88,6 +110,28 @@ def main():
             print("Speech-to-text model already installed at", stt.model_dir())
         else:
             print("Installed at", stt.download())
+    elif args.cmd == "update":
+        from .update import update
+        update()
+    elif args.cmd == "brief":
+        from . import handoff
+        print(handoff.brief(args.key, args.n))
+        if args.open and not handoff.open_claude(args.key, args.n):
+            print("Couldn't open Claude Code here. Start it in the Clipper folder and type:", handoff.prompt(args.key, args.n))
+    elif args.cmd == "meme":
+        from . import memes
+        try:
+            if args.meme_cmd == "search":
+                for r in memes.search(" ".join(args.words), args.kind)[:args.limit]:
+                    extra = f"  {r['duration']:.0f} s" if r.get("duration") else ""
+                    print(f"{r['id']}	{r['name']}{extra}")
+            else:
+                cd = JOBS / args.key / "clips" / str(args.n)
+                if not cd.is_dir():
+                    raise SystemExit(f"No clip {args.n} in {args.key}.")
+                print(memes.save(cd, memes.by_id(args.id, args.name), args.top, args.bottom))
+        except memes.MemeError as ex:
+            raise SystemExit(str(ex))
     elif args.cmd == "list":
         for jd in sorted(JOBS.iterdir()):
             c = read_json(jd / "clips.json", {}) or {}

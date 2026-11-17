@@ -18,25 +18,39 @@ The dashboard runs on your own computer:
 - a chart of chat activity (and the streamer's voice, if you picked it) across the stream, with each clip marked;
 - a ranked list of clips with what chat reacted to and what the streamer said; tick clips to delete several at once;
 - a Short editor: crop the face cam and the gameplay, put the face on top or at the bottom, open on the hottest moment, and add one-word subtitles in the colour you pick;
-- memes for each clip: short video memes with sound, meme sounds, and classic meme images with your own top and bottom text;
+- **Send to Claude:** one button hands the raw clip to Claude Code, which edits it into a finished Short (subtitles, cold open, zooms, memes, censoring) and refines it with you;
 - every delete asks first, and deleted files go to the Trash.
 
 ## Install
 
-macOS or Linux (on Windows, use WSL):
+macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.sh | bash
 ```
 
-The installer checks for git, ffmpeg and Python 3.11+ and offers to install anything missing. It sets up Clipper in `~/Clipper` (you can pick another folder). Then it asks:
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.ps1 | iex
+```
+
+The installer checks for git, ffmpeg and Python 3.11+ and offers to install anything missing (with Homebrew, apt, dnf or pacman on macOS and Linux, and winget on Windows). It sets up Clipper in `~/Clipper` (`%USERPROFILE%\Clipper` on Windows; you can pick another folder). Then it asks:
 
 1. **Speech-to-text?** It downloads NVIDIA Parakeet (~490 MB), which runs offline. It's used for live streams and for the subtitles of Twitch and Kick clips (YouTube clips use YouTube's own subtitles). If you skip it, those get no subtitles and everything else works.
 2. **The Short renderer?** It installs Remotion, which needs Node.js 18+ (~400 MB).
 3. **A `clipper` terminal command?**
-4. **The `/clip` skill for Claude Code?** Asked only if you use Claude Code.
+4. **The `/clip` and `/short` skills for Claude Code?** Asked only if you use Claude Code.
 
-To install without questions, add `--yes` (`... | bash -s -- --yes`). To update, run the same command again.
+To install without questions, add `--yes` (`... | bash -s -- --yes`; on Windows set `$env:CLIPPER_YES = "1"` first).
+
+### Update
+
+```sh
+clipper update
+```
+
+This pulls the latest Clipper from GitHub and refreshes whatever changed: the Python packages, the renderer's packages, and the Claude Code skills. Your streams, clips and settings aren't touched. Restart `clipper serve` afterwards if it was running. (Installed before `clipper update` existed? Run the install command once more, then use `clipper update` from then on.)
 
 ## Use
 
@@ -48,6 +62,8 @@ clipper live https://kick.com/somechannel      # a stream that's live now (Twitc
 clipper render <job> <clip number>              # render a Short from the terminal
 clipper list                                    # every stream you've clipped
 clipper stt-download                            # add speech-to-text later
+clipper update                                  # get the latest version from GitHub
+clipper brief <job> <clip number> --open        # hand a clip to Claude Code (same as the Send to Claude button)
 ```
 
 You can also paste any of these links straight into the dashboard.
@@ -74,7 +90,22 @@ Times count from when Clipper started watching. It stops when you press **Stop w
 
 ### Making a Short
 
-Open a clip, go to **Make the Short**, frame the face cam and the gameplay, and pick the layout and subtitle style. Then press **Render Short**. The Short opens with the clip's loudest moment, then plays the whole clip. You get `final.mp4` (1080×1920, at the source frame rate up to 60 fps) and `final.srt`.
+**With Claude (recommended):** open a clip and press **Send to Claude**. Clipper writes a brief for the clip (`clips/<n>/brief.md`: the files, the chat at the spike, what the streamer says with timings) and opens Claude Code in a new terminal with `/short <job> <clip>`. Claude looks at the clip, then edits it in the house style:
+
+- the face cam stacked as a 30% band on top or bottom, no border;
+- a cold open on the hottest moment, then the full clip;
+- one word at a time subtitles, no box, black shadow, in the colour that suits the footage, with the key words emphasised;
+- words that would cost ad revenue muted with a beep and shown as `F***`;
+- punch-in zooms, a shake and flash on the big hit, a warm or cold grade, meme videos, images and sounds where they land a punchline;
+- 10 hook lines to pick from.
+
+It renders, checks the frames, tells you what it did, and changes what you ask for. If Claude Code isn't installed, the button shows the command to paste into it.
+
+**By hand:** go to **Make the Short**, frame the face cam and the gameplay, and pick the layout and subtitle style. Then press **Render Short**.
+
+Either way, the Short opens with the clip's loudest moment, then plays the whole clip. You get `final.mp4` (1080×1920, at the source frame rate up to 60 fps) and `final.srt`.
+
+Effects live in `clips/<n>/fx.json` next to the dashboard's `edit.json`; the full list of fields is in `clipper/render.py` (`normalize_fx`). Memes for an edit come from `clipper meme search <words> [--kind videos|sounds|images]` and `clipper meme get <job> <clip> <id>`.
 
 ## How it works
 
@@ -90,7 +121,10 @@ Open a clip, go to **Make the Short**, frame the face cam and the gameplay, and 
 | Hottest moment: the loudest 3 s just before chat peaks | `clipper/hotspot.py` |
 | Word timings (Parakeet through sherpa-onnx) | `clipper/stt.py`, `clipper/subs.py` |
 | Face cam guess (OpenCV) | `clipper/face.py` |
-| Render (Remotion) | `clipper/render.py`, `remotion/src/` |
+| Render (Remotion), effects from `fx.json` | `clipper/render.py`, `remotion/src/` |
+| Memes for edits (YouTube, myinstants, memegen/Imgflip) | `clipper/memes.py` |
+| Hand-off to Claude (`brief.md`, opening Claude Code) | `clipper/handoff.py`, `skills/short/` |
+| `clipper update` | `clipper/update.py` |
 | Dashboard (Gradio) | `clipper/app.py` |
 
 Everything Clipper downloads or makes stays in the install folder: `jobs/` for streams and clips, `tmp/` for caches.

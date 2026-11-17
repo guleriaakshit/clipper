@@ -10,8 +10,8 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from . import library, live, memes, pipeline, render, signals, stt
-from .common import JOBS, REMOTION, TMP, read_json, write_json, fmt_t, font as font_of
+from . import handoff, library, live, pipeline, render, signals, stt
+from .common import JOBS, REMOTION, TMP, read_json, write_json, fmt_t, font as font_of, tool
 from .platforms import detect
 
 FACE_C, GAME_C = (63, 160, 255), (242, 162, 58)
@@ -561,14 +561,14 @@ def _ask(kind, ids, key=None):
         size = sum(library.size_of(JOBS / k) for k in ids)
         names = [(read_json(JOBS / k / "clips.json", {}) or {}).get("title") or k for k in ids]
         head = f"Delete {len(ids)} stream{'' if len(ids) == 1 else 's'}?"
-        body = ("Each goes with all its clips, Shorts and memes. " if len(ids) > 1 else
-                f"“{esc(names[0])}” goes with all its clips, Shorts and memes. ")
+        body = ("Each goes with all its clips and Shorts. " if len(ids) > 1 else
+                f"“{esc(names[0])}” goes with all its clips and Shorts. ")
     else:
         size = sum(library.size_of(JOBS / key / "clips" / str(i)) for i in ids)
         head = f"Delete {len(ids)} clip{'' if len(ids) == 1 else 's'}?"
-        body = f"Clip{'' if len(ids) == 1 else 's'} {', '.join(str(i) for i in sorted(ids))}, with Shorts and memes. "
+        body = f"Clip{'' if len(ids) == 1 else 's'} {', '.join(str(i) for i in sorted(ids))}, with its Short and edits. "
     where = (("It goes" if len(ids) == 1 else "They go") + " to the Trash, so you can still get "
-             + ("it" if len(ids) == 1 else "them") + " back.") if library.TRASH.is_dir() else "This can't be undone."
+             + ("it" if len(ids) == 1 else "them") + " back.") if library.can_trash() else "This can't be undone."
     return (kind, list(ids), gr.update(visible=True),
             f'<h3>{head}</h3><p>{body}{library.human(size)} in all. {where}</p>')
 
@@ -722,90 +722,41 @@ def open_studio(key, n):
     write_json(cd / "props.json", render.props_for(JOBS / key, n))
     if STUDIO["proc"] and STUDIO["proc"].poll() is None:
         STUDIO["proc"].terminate()
-    STUDIO["proc"] = subprocess.Popen(["npx", "remotion", "studio", "src/index.ts", f"--props={cd / 'props.json'}",
+    STUDIO["proc"] = subprocess.Popen([tool("npx"), "remotion", "studio", "src/index.ts", f"--props={cd / 'props.json'}",
                                        "--port=3000"], cwd=REMOTION, env=render.chrome_env(), stdout=open(TMP / "studio.log", "w"),
                                       stderr=subprocess.STDOUT)
     return ('<div class="np-note">Remotion Studio is starting. It opens at '
             '<a href="http://localhost:3000/ClipShort" target="_blank">localhost:3000/ClipShort</a> in a few seconds.</div>')
 
 
-# ---------------- memes: video memes with sound, meme sounds, classic images ----------------
-def _meme_outputs(kind=None, image=None, video=None, audio=None):
-    """Preview slots: image (classic), video (video memes), audio (sounds); only the one in use is shown."""
-    return (gr.update(value=image, visible=kind == "image"), gr.update(value=video, visible=kind == "video"),
-            gr.update(value=audio, visible=kind == "sound"))
-
-
-def meme_load(key, n):
-    """Memes already saved for this clip + a search idea from what chat kept saying."""
-    c = next((x for x in clips_of(key) if x["id"] == n), None)
-    if not c:
-        return gr.update(), [], gr.update(value=None, visible=False)
-    cd = JOBS / key / "clips" / str(n)
-    got = memes.saved(cd)
-    return " ".join(c.get("top_words", [])[:2]), memes.saved_visual(cd), gr.update(value=got or None, visible=bool(got))
-
-
-def meme_search(q, source):
-    try:
-        rows = memes.search(q or "", source)
-    except memes.MemeError as ex:
-        raise gr.Error(str(ex))
-    except Exception as ex:
-        raise gr.Error(f"Search failed: {ex}")
-    if not rows:
-        gr.Info("Nothing found. Try another word.")
-    sounds = source == "sounds"
-    gal = [(r["preview"], f"{r['name']} ({r['duration']:.0f} s)" if r.get("duration") else r["name"])
-           for r in rows if r.get("preview")]
-    return (gr.update(value=None if sounds else gal, visible=not sounds),
-            gr.update(choices=[(r["name"], i) for i, r in enumerate(rows)] if sounds else [], value=None, visible=sounds),
-            rows, None, "Click a result to pick it.", gr.update(visible=False), *_meme_outputs())
-
-
-def _picked(r):
-    if not r:
-        return None, "Click a result to pick it.", gr.update(visible=False)
-    src = {"YouTube": "a YouTube meme clip", "Myinstants": "myinstants.com"}.get(r["source"], r["source"])
-    info = f"**{r['name']}**  \nFrom {src}" + (f", [open its page]({r['page']})" if r.get("page") else "")
-    return r, info, gr.update(visible=r["kind"] == "image")
-
-
-def meme_pick(rows, evt: gr.SelectData):
-    vis = [r for r in rows if r.get("preview")]
-    return _picked(vis[evt.index] if vis and evt.index < len(vis) else None)
-
-
-def meme_pick_sound(rows, i):
-    return _picked(rows[int(i)] if rows and i is not None and int(i) < len(rows) else None)
-
-
-def meme_preview(item, top, bottom):
-    if not item:
-        return _meme_outputs()
-    try:
-        if item["kind"] == "image":
-            return _meme_outputs("image", image=memes.captioned(item, top or "", bottom or ""))
-        f = str(memes.blank(item))          # downloads the clip/sound once, then it's cached
-        return _meme_outputs(item["kind"], video=f if item["kind"] == "video" else None,
-                             audio=f if item["kind"] == "sound" else None)
-    except Exception as ex:
-        raise gr.Error(f"Preview failed: {ex}")
-
-
-def meme_save(key, n, item, top, bottom):
+# ---------------- hand-off to Claude ----------------
+def send_to_claude(key, n):
+    """Write the clip's brief, open Claude Code on it, and show the command either way."""
     if not key or n is None:
-        raise gr.Error("Open a clip first (Clips tab).")
-    if not item:
-        raise gr.Error("Click a meme in the results first.")
-    cd = JOBS / key / "clips" / str(n)
+        raise gr.Error("Open a clip first.")
     try:
-        f = memes.save(cd, item, top or "", bottom or "")
-    except Exception as ex:
-        raise gr.Error(f"Save failed: {ex}")
-    got = memes.saved(cd)
-    return (f"Saved `{Path(f).name}` in `clips/{n}/memes/`.", memes.saved_visual(cd),
-            gr.update(value=got, visible=True))
+        f = handoff.brief(key, int(n))
+    except FileNotFoundError as ex:
+        raise gr.Error(str(ex))
+    cmd = handoff.prompt(key, int(n))
+    opened = handoff.open_claude(key, int(n))
+    head = ("<b>Sent to Claude.</b> Claude Code opened in a new terminal window and is starting on this clip."
+            if opened else
+            "<b>Ready for Claude.</b> Claude Code isn't installed here or a terminal couldn't be opened, so start "
+            "Claude Code in the Clipper folder and paste this:")
+    return (f'<div class="np-note np-ok">{head}<div class="np-cmd"><code>{esc(cmd)}</code>'
+            f'<button class="np-copy" data-copy="{esc(cmd)}">Copy</button></div>'
+            f'<p>Claude reads <code>{esc(f.relative_to(JOBS.parent).as_posix())}</code>, then adds the subtitles, '
+            f'effects and memes, renders, and asks you what to change.</p></div>')
+
+
+COPY_JS = """
+element.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-copy]');
+  if (!b) return;
+  navigator.clipboard.writeText(b.dataset.copy).then(() => { b.textContent = 'Copied'; setTimeout(() => { b.textContent = 'Copy'; }, 1500); });
+});
+"""
 
 
 # ---------------- UI ----------------
@@ -1104,11 +1055,10 @@ button[role="tab"].selected::after, button[role="tab"][aria-selected="true"]::af
 #sw-white::before { background: #FFFFFF; } #sw-yellow::before { background: #FFD400; } #sw-sky::before { background: #3FA0FF; }
 #sw-green::before { background: #39FF6A; } #sw-pink::before { background: #FF4FD8; }
 
-/* memes */
-#np-minfo { padding: 2px 0 6px; }
-#np-sounds .wrap { display: flex; flex-direction: column; gap: 6px; max-height: 520px; overflow-y: auto; }
-#np-sounds label { width: 100%; }
-#np-msearch { min-height: 44px; align-self: flex-end; }
+/* send to Claude */
+.np-cmd { display: flex; align-items: center; gap: 8px; margin: 8px 0 6px; }
+.np-cmd code { flex: 1; padding: 6px 10px; border-radius: 6px; background: var(--sheet); border: 1px solid var(--rule); font-size: 14px; }
+.np-copy { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--rule); background: var(--sheet); cursor: pointer; font: inherit; font-size: 13px; }
 
 /* media */
 .np-media img, .np-media video { border-radius: 6px; }
@@ -1222,6 +1172,8 @@ def build():
                                 clip_list = gr.HTML(list_html(None), js_on_load=PICK_JS)
                             with gr.Column(scale=5, min_width=360):
                                 card = gr.HTML(card_html(None, None), js_on_load=None)
+                                send_btn = gr.Button("Send to Claude", variant="primary", visible=False, elem_id="np-send")
+                                send_msg = gr.HTML(js_on_load=COPY_JS)
                                 src_vid = gr.Video(label="Clip as downloaded", show_label=False, interactive=False,
                                                    elem_classes="np-media", visible=False)
 
@@ -1288,42 +1240,6 @@ def build():
                                 files = gr.File(label="Downloads (MP4 and SRT)", file_count="multiple", interactive=False,
                                                 visible=False)
 
-                    with gr.Tab("Memes"):
-                        with gr.Row(equal_height=False):
-                            with gr.Column(scale=3, min_width=380):
-                                section("Find a meme", "Video memes with sound are short clips (40 s or less) found on "
-                                        "YouTube. Meme sounds come from myinstants.com. Classic images come from "
-                                        "memegen.link and Imgflip.")
-                                m_src = gr.Radio([("Video memes with sound", "videos"), ("Meme sounds", "sounds"),
-                                                  ("Classic images", "classic")], value="videos", label="Source")
-                                with gr.Row(equal_height=True):
-                                    m_q = gr.Textbox(label="Search (leave empty for popular ones)", scale=4,
-                                                     placeholder="bruh, emotional damage, vine boom")
-                                    m_search = gr.Button("Search memes", variant="primary", scale=1, min_width=150,
-                                                         elem_id="np-msearch")
-                                m_rows = gr.State([])
-                                m_item = gr.State(None)
-                                m_results = gr.Gallery(label="Results", show_label=False, columns=4, height=520,
-                                                       object_fit="cover", allow_preview=False)
-                                m_sounds = gr.Radio([], label="Sounds: click one to hear it", visible=False,
-                                                    elem_id="np-sounds")
-                            with gr.Column(scale=2, min_width=340):
-                                section("Picked meme")
-                                m_info = gr.Markdown("Click a result to pick it.", elem_id="np-minfo")
-                                with gr.Group(visible=False) as m_text:
-                                    m_top = gr.Textbox(label="Top text (optional)")
-                                    m_bottom = gr.Textbox(label="Bottom text (optional)")
-                                m_pv = gr.Image(label="Preview", show_label=False, interactive=False, height=320,
-                                                buttons=[], elem_classes="np-media", visible=False)
-                                m_pv_vid = gr.Video(label="Preview", show_label=False, interactive=False, height=320,
-                                                    elem_classes="np-media", visible=False)
-                                m_pv_aud = gr.Audio(label="Preview", show_label=False, interactive=False, visible=False)
-                                m_save = gr.Button("Save to this clip", variant="primary")
-                                m_msg = gr.Markdown()
-                                section("Saved for this clip", "Newest first. Sounds are in the downloads below.")
-                                m_gallery = gr.Gallery(show_label=False, columns=3, height=240, object_fit="contain")
-                                m_files = gr.File(label="Downloads", file_count="multiple", interactive=False,
-                                                  visible=False)
 
         timer = gr.Timer(2.0)
         edit_inputs = [job, clip, t, layout, split, fx, fy, fw, gx, gy, gw, hook_on, hs, he, ts, te, subs_on, color, size, sy, upper]
@@ -1366,19 +1282,9 @@ def build():
             do_render, [job, clip], [render_msg, final_vid, files], **quiet)
         studio_btn.click(apply_edit, edit_inputs, [crop_view, pv], **quiet).then(open_studio, [job, clip], render_msg, **quiet)
 
-        # memes
-        clip.change(meme_load, [job, clip], [m_q, m_gallery, m_files], **quiet)
-        pv_out = [m_pv, m_pv_vid, m_pv_aud]
-        for ev in (m_search.click, m_q.submit, m_src.change):
-            ev(meme_search, [m_q, m_src], [m_results, m_sounds, m_rows, m_item, m_info, m_text] + pv_out)
-        m_results.select(meme_pick, m_rows, [m_item, m_info, m_text], **quiet).then(
-            meme_preview, [m_item, m_top, m_bottom], pv_out)
-        m_sounds.input(meme_pick_sound, [m_rows, m_sounds], [m_item, m_info, m_text], **quiet).then(
-            meme_preview, [m_item, m_top, m_bottom], pv_out)
-        for box in (m_top, m_bottom):
-            box.submit(meme_preview, [m_item, m_top, m_bottom], pv_out)
-            box.blur(meme_preview, [m_item, m_top, m_bottom], pv_out)
-        m_save.click(meme_save, [job, clip, m_item, m_top, m_bottom], [m_msg, m_gallery, m_files])
+        # hand-off to Claude
+        clip.change(lambda n: (gr.update(visible=n is not None), ""), clip, [send_btn, send_msg], **quiet)
+        send_btn.click(send_to_claude, [job, clip], send_msg)
     return demo
 
 

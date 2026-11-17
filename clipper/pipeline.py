@@ -113,7 +113,7 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
         cd.mkdir(parents=True, exist_ok=True)
         if (cd / "source.mp4").exists() and (read_json(cd / "clip.json") or {}).get("start") == c["start"]:
             continue
-        for stale in ("edit.json", "final.mp4", "final.srt", "props.json"):
+        for stale in ("edit.json", "final.mp4", "final.srt", "props.json", "fx.json", "brief.md"):
             (cd / stale).unlink(missing_ok=True)
         _step(jd, "download", base, f"Clip {c['id']}/{n}: downloading {fmt_t(c['start'])}-{fmt_t(c['end'])} (best quality)")
         src, info = download.section(url, c["start"], c["end"], cd, cookies_browser)

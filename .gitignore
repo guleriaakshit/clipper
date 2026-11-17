@@ -5,11 +5,13 @@ models/
 config.json
 .venv/
 __pycache__/
+*.egg-info/
 *.pyc
 .DS_Store
 bin/
 remotion/node_modules/
 remotion/public/clips/
+remotion/public/sfx/
 remotion/out/
 # personal notes
 CLAUDE.md

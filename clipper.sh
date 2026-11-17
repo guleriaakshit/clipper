@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run Clipper from anywhere: clipper serve | analyze <url> | live <url> | stop <job> | render <job> <n> | list | stt-download
+# Run Clipper from anywhere: clipper serve | analyze <url> | live <url> | stop <job> | render <job> <n> | list | update | stt-download
 # Works through a symlink (install.sh links it as ~/.local/bin/clipper).
 src="${BASH_SOURCE[0]}"
 while [ -L "$src" ]; do

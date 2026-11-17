@@ -13,7 +13,7 @@ def words(src, out_json):
         if not txt:
             continue
         out.append({"text": txt, "start": round(x["start"], 3), "end": round(min(x["end"], x["start"] + 0.9), 3)})
-    out_json.write_text(json.dumps(out, indent=1, ensure_ascii=False))
+    out_json.write_text(json.dumps(out, indent=1, ensure_ascii=False), encoding="utf-8")
     return out
 
 

@@ -1,4 +1,4 @@
-"""Pre-existing memes for a clip, most with sound:
+"""Pre-existing memes for a clip, most with sound, for Claude to use in an edit (`clipper meme search|get`):
 - video memes with sound: short meme clips (40 s or less) found through yt-dlp's YouTube search, saved as MP4;
 - meme sounds: sound buttons from myinstants.com, saved as MP3;
 - classic meme images: memegen.link + Imgflip's top 100 (free, no key); top/bottom text drawn locally in Impact.
@@ -135,11 +135,30 @@ def sounds(query="", limit=40):
     return out
 
 
-SOURCES = {"videos": videos, "sounds": sounds, "classic": classic}
+SOURCES = {"videos": videos, "sounds": sounds, "classic": classic, "images": classic}
 
 
 def search(query, source):
     return SOURCES.get(source, videos)(query)
+
+
+def by_id(mid: str, name: str = "") -> dict:
+    """Rebuild a search result from its id (yt:<id>, myinstants:<file>.mp3, memegen:<id>, imgflip:<id>)."""
+    kind, _, rest = mid.partition(":")
+    if not rest:
+        raise MemeError(f"Not a meme id: {mid!r}. Ids look like yt:dQw4w9WgXcQ or myinstants:vine-boom.mp3.")
+    if kind == "yt":
+        url = f"https://www.youtube.com/watch?v={rest}"
+        return {"id": mid, "name": name or rest, "source": "YouTube", "kind": "video", "yt": rest, "url": url,
+                "page": url, "memegen": None, "lines": 0}
+    if kind == "myinstants":
+        return {"id": mid, "name": name or rest.rsplit(".", 1)[0], "source": "Myinstants", "kind": "sound",
+                "url": f"https://www.myinstants.com/media/sounds/{rest}", "page": None, "memegen": None, "lines": 0}
+    if kind in ("memegen", "imgflip"):
+        it = next((x for x in _index() if x["id"] == mid), None)
+        if it:
+            return dict(it, name=name or it["name"])
+    raise MemeError(f"No meme with id {mid!r}. Search again with: clipper meme search <words>")
 
 
 # ---------------- captions + saving ----------------

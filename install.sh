@@ -46,7 +46,7 @@ OS="$(uname -s)"
 case "$OS" in
   Darwin) PM=""; have brew && PM=brew ;;
   Linux)  PM=""; have apt-get && PM=apt; have dnf && PM=dnf; have pacman && PM=pacman ;;
-  *) die "Clipper runs on macOS and Linux. On Windows, use WSL." ;;
+  *) die "This installer is for macOS and Linux. On Windows, in PowerShell: irm https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.ps1 | iex" ;;
 esac
 
 pkg_install() {   # pkg_install <brew names> <apt names> <dnf names> <pacman names>
@@ -179,13 +179,16 @@ fi
 
 if [ -d "$HOME/.claude" ] && ! skipped skill; then
   step "7. Claude Code"
-  if ask "Install the /clip skill for Claude Code (it runs Clipper and writes what happens in each clip)?" y; then
-    mkdir -p "$HOME/.claude/skills/clip"
-    if [ -f "$HOME/.claude/skills/clip/SKILL.md" ] && ! cmp -s "$DIR/skills/clip/SKILL.md" "$HOME/.claude/skills/clip/SKILL.md"; then
-      if ask "You already have a /clip skill. Replace it?" n; then cp "$DIR/skills/clip/SKILL.md" "$HOME/.claude/skills/clip/SKILL.md" && ok "Replaced"; fi
-    else
-      cp "$DIR/skills/clip/SKILL.md" "$HOME/.claude/skills/clip/SKILL.md" && ok "Installed /clip"
-    fi
+  say "  ${dim}/clip runs Clipper and writes what happens in each clip; /short edits a clip into a Short (the dashboard's Send to Claude button uses it).${off}"
+  if ask "Install the /clip and /short skills for Claude Code?" y; then
+    for name in clip short; do
+      mkdir -p "$HOME/.claude/skills/$name"
+      if [ -f "$HOME/.claude/skills/$name/SKILL.md" ] && ! cmp -s "$DIR/skills/$name/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md"; then
+        if ask "You already have a /$name skill. Replace it?" n; then cp "$DIR/skills/$name/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md" && ok "Replaced /$name"; fi
+      else
+        cp "$DIR/skills/$name/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md" && ok "Installed /$name"
+      fi
+    done
   fi
 fi
 
@@ -205,4 +208,5 @@ step "Done"
 say "  Start the dashboard:  ${bold}clipper serve${off}   (or $DIR/clipper.sh serve)  then open http://localhost:8765"
 say "  Past stream:          clipper analyze <Twitch VOD / YouTube / Kick VOD link>"
 say "  Live stream:          clipper live <twitch.tv/channel or live YouTube link>"
+say "  Get the latest:       clipper update"
 if ! skipped open && ask "Open the dashboard now?" n; then exec "$DIR/clipper.sh" serve; fi
