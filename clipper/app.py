@@ -100,7 +100,8 @@ def status_html(key):
         stats.append(("Stream length", fmt_t(s["duration"])))
     stats.append(("Clips found", str(len(s.get("clips", [])))))
     dl = "".join(f"<div><dt>{a}</dt><dd>{b}</dd></div>" for a, b in stats)
-    return f'<div class="np-status">{head}<dl class="np-stats">{dl}</dl></div>'
+    notes = "".join(f'<p class="np-livemsg">{esc(n)}</p>' for n in s.get("notes") or [])
+    return f'<div class="np-status">{head}<dl class="np-stats">{dl}</dl>{notes}</div>'
 
 
 def _tick_step(dur):
@@ -428,14 +429,17 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or [])]
     if not basis:
         raise gr.Error("Pick at least one way to find clips: chat spikes, loud voice or what's said.")
-    if "speech" in basis and not stt.available():
-        raise gr.Error("Finding clips by what's said needs the speech-to-text model. In a terminal run: clipper stt-download")
     try:
         target = live.probe(url or "")
     except live.NotLive as e:
         raise gr.Error(str(e))
     except Exception as e:
         raise gr.Error(f"Couldn't check that link: {e}")
+    if target and "speech" in basis and not stt.available():
+        raise gr.Error("Live streams are transcribed on your computer, which needs the speech-to-text model. "
+                       "In a terminal run: clipper stt-download")
+    if not target and basis == ["audio"]:
+        raise gr.Error("Loud voice works on live streams only. For a past stream, pick chat spikes or what's said.")
     if target:
         jd = live.new_job(target, hours=float(hours or 6), basis=basis, keywords=keywords or "")
         live.start_process(jd)
@@ -468,8 +472,19 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
     return key
 
 
+def _running_past(key):
+    jd = JOBS / key
+    st = read_json(jd / "status.json", {}) or {}
+    return (not (read_json(jd / "job.json", {}) or {}).get("live") and st.get("stage") not in (None, "", "done", "error")
+            and not st.get("error") and time.time() - (jd / "status.json").stat().st_mtime < 900)
+
+
 def _stop_btn(key):
-    return gr.update(visible=bool(key) and live.running(JOBS / key))
+    if not key or not (JOBS / key).exists():
+        return gr.update(visible=False)
+    if live.running(JOBS / key):
+        return gr.update(visible=True, value="Stop watching")
+    return gr.update(visible=_running_past(key), value="Stop")
 
 
 def _del_btn(key):
@@ -489,9 +504,12 @@ def switch_job(key):
 
 
 def stop_live(key):
-    if key:
+    if key and live.running(JOBS / key):
         live.stop(JOBS / key)
         gr.Info("Stopping. Clips already cut stay.")
+    elif key:
+        (JOBS / key / "stop").touch()        # pipeline._step picks this up at its next step
+        gr.Info("Stopping after the current step.")
     return gr.update(visible=False)
 
 
@@ -1141,10 +1159,12 @@ def build():
                         'and cuts those moments into vertical Shorts.</p></div>', js_on_load=None)
                 url = gr.Textbox(label="Stream link", show_label=False, container=False, elem_id="np-url", lines=1,
                                  max_lines=1, placeholder="Paste a past VOD or a live channel")
-                by_opts = [("Chat spikes", "chat"), ("Streamer gets loud", "audio"),
-                           ("What's said (subtitles)" + ("" if stt.available() else ", needs speech-to-text"), "speech")]
+                by_opts = [("Chat spikes", "chat"), ("Streamer gets loud (live streams)", "audio"),
+                           ("What's said (subtitles)", "speech")]
                 basis = gr.CheckboxGroup(by_opts, value=["chat"], label="Find clips by", elem_id="np-basis",
-                                         info="Tick one or more. Moments where several agree rank higher.")
+                                         info="Tick one or more; moments where several agree rank higher. Past "
+                                              "streams use YouTube's own subtitles (Twitch and Kick VODs have none) "
+                                              "and are never listened to. Live streams are listened to on your computer.")
                 keywords = gr.Textbox(label="Words to listen for (optional)", visible=False, elem_id="np-words",
                                       placeholder="no way, let's go, clip that", lines=1, max_lines=2)
                 go = gr.Button("Find clips", variant="primary", elem_id="np-go")

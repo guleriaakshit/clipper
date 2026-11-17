@@ -2,9 +2,11 @@
 import traceback
 from pathlib import Path
 
-from . import chat, download, face, hotspot, render, signals, spikes, stt, subs
+from . import captions, chat, download, face, hotspot, render, signals, spikes, stt, subs
 from .common import job_dir, read_json, set_status, write_json, fmt_t
 from .platforms import detect
+
+PLATFORM_NAME = {"twitch": "Twitch", "youtube": "YouTube", "kick": "Kick"}
 
 
 def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=False, basis=("chat",), keywords=""):
@@ -14,6 +16,7 @@ def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=F
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or ())] or ["chat"]
     write_json(jd / "job.json", {"url": url, "platform": platform, "id": vid, "cookies_browser": cookies_browser,
                                  "basis": basis, "keywords": keywords})
+    (jd / "stop").unlink(missing_ok=True)
     try:
         _run(url, platform, vid, jd, top_n, cookies_browser, chat_file, skip_download, basis, keywords)
     except Exception as e:
@@ -23,8 +26,19 @@ def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=F
     return jd
 
 
+class Stopped(RuntimeError):
+    pass
+
+
+def _step(jd, stage, pct, msg=""):
+    """Status update + the place a Stop from the dashboard takes effect."""
+    if (jd / "stop").exists():
+        raise Stopped("Stopped by you.")
+    set_status(jd, stage, pct, msg)
+
+
 def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_download, basis, keywords):
-    prog = lambda pct, msg: set_status(jd, "chat", pct, msg)
+    prog = lambda pct, msg: _step(jd, "chat", pct, msg)
     msgs = []
     if (jd / "chat.json").exists() and not chat_file:
         msgs, meta = read_json(jd / "chat.json"), read_json(jd / "meta.json")
@@ -40,24 +54,26 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
     if not meta.get("duration"):
         raise RuntimeError("Couldn't tell how long this stream is.")
 
-    db, words = None, None
-    if "audio" in basis or "speech" in basis:
-        speech = "speech" in basis
-        if speech and not stt.available():
-            raise RuntimeError("Finding clips by what's said needs the speech-to-text model. Run `clipper stt-download`.")
-        old = read_json(jd / "signals.json", {}) or {}
-        if old.get("db") and (not speech or (jd / "transcript.json").exists()):
-            db, words = old["db"], read_json(jd / "transcript.json") if speech else None
-        else:
-            scan = signals.scan_url(url, meta["duration"], speech=speech, cookies_browser=cookies_browser,
-                                    progress=lambda pct, msg: set_status(jd, "listen", pct, msg))
-            db, words = scan.db, (scan.words if speech else None)
-            write_json(jd / "signals.json", {"bin": signals.BIN, "db": db})
-            if speech:
-                write_json(jd / "transcript.json", words)
+    # Published streams are never listened to or transcribed: "what's said" comes from the platform's own
+    # auto-generated subtitles (YouTube); loud-voice detection is for live streams only (live.py).
+    notes = []
+    if "audio" in basis:
+        basis = [b for b in basis if b != "audio"]
+        notes.append("Loud voice works on live streams only, so it was skipped.")
+    _step(jd, "captions", 31, "Getting the stream's subtitles")
+    words = captions.fetch(url, jd, platform, cookies_browser)
+    if "speech" in basis and not words:
+        basis = [b for b in basis if b != "speech"]
+        notes.append(f"{PLATFORM_NAME.get(platform, platform)} has no subtitles for this stream, so what's said was skipped.")
+    if not basis:
+        raise RuntimeError(" ".join(notes) + " Pick chat spikes for this stream.")
+    if notes:
+        j = read_json(jd / "job.json", {}) or {}
+        write_json(jd / "job.json", {**j, "basis_used": basis, "notes": notes})
+    db = None
 
     names = ", ".join(signals.NAMES[b].lower() for b in basis)
-    set_status(jd, "spikes", 32, f"Finding moments by {names}")
+    _step(jd, "spikes", 32, f"Finding moments by {names}")
     if "chat" in basis and not msgs:
         raise RuntimeError("No chat to find spikes in. Untick chat spikes or add a chat file.")
     res = signals.find(basis, meta["duration"], msgs=msgs, db=db, words=words, keywords=keywords, top_n=top_n)
@@ -71,7 +87,7 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
             c["what"], c["why"] = "", ""
     summary = {"url": url, "platform": platform, "id": vid, "title": meta.get("title"), "channel": meta.get("channel"),
                "duration": meta["duration"], "messages": len(msgs), "avg_per_min": res.get("avg_per_min", 0),
-               "bin": res["bin"], "basis": basis, "keywords": keywords, "clips": res["clips"]}
+               "bin": res["bin"], "basis": basis, "keywords": keywords, "notes": notes, "clips": res["clips"]}
     if msgs:
         write_json(jd / "rates.json", {"bin": res["bin"], "avg": res["avg"], "counts": res["counts"]})
     else:
@@ -94,19 +110,24 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
             continue
         for stale in ("edit.json", "final.mp4", "final.srt", "props.json"):
             (cd / stale).unlink(missing_ok=True)
-        set_status(jd, "download", base, f"Clip {c['id']}/{n}: downloading {fmt_t(c['start'])}-{fmt_t(c['end'])} (best quality)")
+        _step(jd, "download", base, f"Clip {c['id']}/{n}: downloading {fmt_t(c['start'])}-{fmt_t(c['end'])} (best quality)")
         src, info = download.section(url, c["start"], c["end"], cd, cookies_browser)
-        prepare_clip(cd, c, src, info, lambda f, m: set_status(jd, "prepare", base + step * f, f"Clip {c['id']}/{n}: {m}"))
+        prepare_clip(cd, c, src, info, lambda f, m: _step(jd, "prepare", base + step * f, f"Clip {c['id']}/{n}: {m}"),
+                     captions_words=words)
     set_status(jd, "done", 100, f"{n} clips ready")
 
 
-def prepare_clip(cd: Path, c, src, info, progress=lambda frac, msg: None):
+def prepare_clip(cd: Path, c, src, info, progress=lambda frac, msg: None, captions_words=None):
     """After the clip's source.mp4 exists: hot moment, word timings, face crop, clip.json, edit.json."""
     progress(0.5, "finding the hot moment")
     hook = hotspot.find(src, c["start"], c.get("hot_ref", c["chat_peak"]), info["duration"])
-    progress(0.6, "transcribing for subtitles")
     try:
-        subs.words(src, cd / "words.json")
+        if captions_words:                 # the platform's own subtitles, cut to this clip
+            progress(0.6, "subtitles from the stream's captions")
+            write_json(cd / "words.json", captions.clip_words(captions_words, c["start"], c["start"] + info["duration"]))
+        else:                              # no platform subtitles (Twitch, Kick, live): transcribe just this clip
+            progress(0.6, "transcribing this clip for subtitles")
+            subs.words(src, cd / "words.json")
     except Exception as e:  # subtitles are optional; the clip still works
         write_json(cd / "words.json", [])
         (cd / "subs_error.log").write_text(str(e))

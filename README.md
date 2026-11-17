@@ -7,8 +7,8 @@ It works on **past streams** (Twitch VODs, YouTube streams, Kick VODs) and on **
 You choose how clips are found, one way or several at once:
 
 - **Chat spikes:** chat runs at 2× the stream's average or more. The score weighs how far chat jumped, how many different people were typing, how long the spike lasted and what kind of reaction it was (laughing, hype, shock, "clip it").
-- **Streamer gets loud:** the streamer's voice goes at least 6 dB above their usual level over the last 10 minutes. Clipper downloads only the audio for this.
-- **What's said:** Clipper transcribes the stream and looks for reaction phrases ("no way", "oh my god", "let's go"…) and any words you give it. This needs the speech-to-text model.
+- **What's said:** reaction phrases ("no way", "oh my god", "let's go"…) and any words you give it. Past streams use YouTube's own auto-generated subtitles, so nothing is listened to or transcribed. Twitch and Kick VODs have no subtitles, so this option isn't available for them. Live streams are transcribed on your computer (needs the speech-to-text model).
+- **Streamer gets loud** (live streams only): the streamer's voice goes at least 6 dB above their usual level over the last 10 minutes.
 
 Each moment gets a score out of 100, and moments where several signals agree rank higher. The dashboard shows which signal found each clip.
 
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.
 
 The installer checks for git, ffmpeg and Python 3.11+ and offers to install anything missing. It sets up Clipper in `~/Clipper` (you can pick another folder). Then it asks:
 
-1. **Speech-to-text for subtitles?** It downloads NVIDIA Parakeet (~490 MB), which runs offline. If you skip it, Shorts have no subtitles and everything else works.
+1. **Speech-to-text?** It downloads NVIDIA Parakeet (~490 MB), which runs offline. It's used for live streams and for the subtitles of Twitch and Kick clips (YouTube clips use YouTube's own subtitles). If you skip it, those get no subtitles and everything else works.
 2. **The Short renderer?** It installs Remotion, which needs Node.js 18+ (~400 MB).
 3. **A `clipper` terminal command?**
 4. **The `/clip` skill for Claude Code?** Asked only if you use Claude Code.
@@ -43,7 +43,7 @@ To install without questions, add `--yes` (`... | bash -s -- --yes`). To update,
 ```sh
 clipper serve                                   # dashboard at http://localhost:8765
 clipper analyze https://www.twitch.tv/videos/…  # a past stream, found by chat spikes
-clipper analyze <link> --by chat,audio,speech --words "no way,clip that"   # any mix of signals
+clipper analyze <link> --by chat,speech --words "no way,clip that"   # chat and what's said (YouTube subtitles)
 clipper live https://www.twitch.tv/somechannel  # a stream that's live now (Ctrl+C or `clipper stop <job>` to stop)
 clipper render <job> <clip number>              # render a Short from the terminal
 clipper list                                    # every stream you've clipped
@@ -56,7 +56,7 @@ You can also paste any of these links straight into the dashboard.
 
 - **Twitch:** chat comes from Twitch's public web API. No login is needed.
 - **YouTube:** chat comes from the video's chat replay, which must have been on during the stream.
-- **Kick:** Kick's chat history sits behind Cloudflare's bot check, so Clipper doesn't read it. Export the chat with another tool and add it with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns. Or find Kick clips without chat: by loud voice and what's said.
+- **Kick:** Kick's chat history sits behind Cloudflare's bot check, so Clipper doesn't read it. Export the chat with another tool and add it with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns.
 - **Members-only or age-gated videos:** use `--cookies-from-browser chrome` (or safari, firefox, brave, edge).
 
 Clipper downloads only the clips themselves, in the best resolution and then the highest frame rate available.
@@ -81,6 +81,7 @@ Open a clip, go to **Make the Short**, frame the face cam and the gameplay, and 
 | --- | --- |
 | Chat → messages per 5 s → average → spikes → score | `clipper/spikes.py` |
 | Loud voice and what's said, mixed with chat | `clipper/signals.py` |
+| YouTube's own subtitles for past streams | `clipper/captions.py` |
 | Clip window: starts 20 s before chat reacts and ends after chat calms down (20–60 s) | `clipper/spikes.py` |
 | Download only that part (`yt-dlp --download-sections`) | `clipper/download.py` |
 | Live: chat readers, rolling recorder, cutting | `clipper/live.py` |
