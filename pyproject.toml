@@ -26,3 +26,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["clipper", "clipper.chat"]
+
+[tool.setuptools.package-data]
+clipper = ["assets/*"]

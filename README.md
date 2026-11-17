@@ -2,15 +2,24 @@
 
 Clipper finds the moments in a stream where chat lost it, cuts them out in the best quality available, and turns them into vertical Shorts.
 
-It works on **past streams** (Twitch VODs, YouTube streams, Kick VODs) and on **streams that are live right now** (Twitch channels, live YouTube streams). A chat spike is a stretch where chat runs at 2× the stream's average or more. Each spike gets a score out of 100. The score weighs how far chat jumped, how many different people were typing, how long the spike lasted and what kind of reaction it was (laughing, hype, shock, "clip it").
+It works on **past streams** (Twitch VODs, YouTube streams, Kick VODs) and on **streams that are live right now** (Twitch channels, live YouTube streams).
+
+You choose how clips are found, one way or several at once:
+
+- **Chat spikes:** chat runs at 2× the stream's average or more. The score weighs how far chat jumped, how many different people were typing, how long the spike lasted and what kind of reaction it was (laughing, hype, shock, "clip it").
+- **Streamer gets loud:** the streamer's voice goes at least 6 dB above their usual level over the last 10 minutes. Clipper downloads only the audio for this.
+- **What's said:** Clipper transcribes the stream and looks for reaction phrases ("no way", "oh my god", "let's go"…) and any words you give it. This needs the speech-to-text model.
+
+Each moment gets a score out of 100, and moments where several signals agree rank higher. The dashboard shows which signal found each clip.
 
 The dashboard runs on your own computer:
 
-- a chart of chat activity across the stream, with each clip marked;
-- a ranked list of clips with what chat reacted to;
+- a library of your streams on the left: open one, or tick several and delete them;
+- a chart of chat activity (and the streamer's voice, if you picked it) across the stream, with each clip marked;
+- a ranked list of clips with what chat reacted to and what the streamer said; tick clips to delete several at once;
 - a Short editor: crop the face cam and the gameplay, put the face on top or at the bottom, open on the hottest moment, and add one-word subtitles in the colour you pick;
 - memes for each clip: short video memes with sound, meme sounds, and classic meme images with your own top and bottom text;
-- a library to delete streams and clips you don't need any more (they go to the Trash).
+- every delete asks first, and deleted files go to the Trash.
 
 ## Install
 
@@ -33,7 +42,8 @@ To install without questions, add `--yes` (`... | bash -s -- --yes`). To update,
 
 ```sh
 clipper serve                                   # dashboard at http://localhost:8765
-clipper analyze https://www.twitch.tv/videos/…  # a past stream
+clipper analyze https://www.twitch.tv/videos/…  # a past stream, found by chat spikes
+clipper analyze <link> --by chat,audio,speech --words "no way,clip that"   # any mix of signals
 clipper live https://www.twitch.tv/somechannel  # a stream that's live now (Ctrl+C or `clipper stop <job>` to stop)
 clipper render <job> <clip number>              # render a Short from the terminal
 clipper list                                    # every stream you've clipped
@@ -46,7 +56,7 @@ You can also paste any of these links straight into the dashboard.
 
 - **Twitch:** chat comes from Twitch's public web API. No login is needed.
 - **YouTube:** chat comes from the video's chat replay, which must have been on during the stream.
-- **Kick:** Kick's chat history sits behind Cloudflare's bot check, so Clipper doesn't read it. Export the chat with another tool and add it with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns.
+- **Kick:** Kick's chat history sits behind Cloudflare's bot check, so Clipper doesn't read it. Export the chat with another tool and add it with `--chat-file chat.json` (or under *More options* in the dashboard). This accepts TwitchDownloader JSON, chat-downloader JSON, or a CSV with `t,user,text` columns. Or find Kick clips without chat: by loud voice and what's said.
 - **Members-only or age-gated videos:** use `--cookies-from-browser chrome` (or safari, firefox, brave, edge).
 
 Clipper downloads only the clips themselves, in the best resolution and then the highest frame rate available.
@@ -70,6 +80,7 @@ Open a clip, go to **Make the Short**, frame the face cam and the gameplay, and 
 | Step | Code |
 | --- | --- |
 | Chat → messages per 5 s → average → spikes → score | `clipper/spikes.py` |
+| Loud voice and what's said, mixed with chat | `clipper/signals.py` |
 | Clip window: starts 20 s before chat reacts and ends after chat calms down (20–60 s) | `clipper/spikes.py` |
 | Download only that part (`yt-dlp --download-sections`) | `clipper/download.py` |
 | Live: chat readers, rolling recorder, cutting | `clipper/live.py` |
@@ -84,6 +95,7 @@ Everything Clipper downloads or makes stays in the install folder: `jobs/` for s
 ## Notes
 
 - Clipper works with other people's streams and memes. Check what you're allowed to post where you post it.
+- The dashboard font is Instrument Sans (SIL Open Font License, `clipper/assets/OFL.txt`).
 - Meme sources: YouTube for short video memes (fetched with yt-dlp), [myinstants.com](https://www.myinstants.com) for sounds, and [memegen.link](https://memegen.link) and [Imgflip](https://imgflip.com) for images.
 
 MIT licence.

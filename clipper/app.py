@@ -10,7 +10,7 @@ from pathlib import Path
 import gradio as gr
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from . import library, live, memes, pipeline, render
+from . import library, live, memes, pipeline, render, signals, stt
 from .common import JOBS, REMOTION, TMP, read_json, write_json, fmt_t, font as font_of
 from .platforms import detect
 
@@ -89,6 +89,9 @@ def status_html(key):
                 f'<div class="np-bar"><i style="width:{pct:.1f}%"></i></div>'
                 f'<p>{esc(st.get("msg") or "")}</p></div></div>')
     stats = []
+    basis = s.get("basis") or ["chat"]
+    if basis != ["chat"]:
+        stats.append(("Found by", "<span class='np-by'>" + ", ".join(signals.NAMES[x] for x in basis) + "</span>"))
     if s.get("messages"):
         stats.append(("Chat messages", f"{s['messages']:,}"))
     if s.get("avg_per_min") is not None:
@@ -107,31 +110,69 @@ def _tick_step(dur):
     return 14400
 
 
+def _series_path(vals, top, cols_n):
+    pts = [f"{(i + 0.5) / cols_n * 1000:.1f},{100 - v / top * 100:.2f}" for i, v in enumerate(vals)]
+    return pts
+
+
+def _down(vals, cols):
+    n = len(vals)
+    per = n / cols
+    return [max(vals[int(i * per):max(int((i + 1) * per), int(i * per) + 1)]) for i in range(cols)]
+
+
 def chart_html(key, sel=None):
     r = read_json(JOBS / key / "rates.json", {}) if key else None
-    if not r or not r.get("counts"):
-        return ('<div class="np-chart np-chart-empty"><p>Chat activity shows here once a stream has been read.</p></div>')
-    b, counts = float(r["bin"]), r["counts"]
-    n = len(counts)
+    sg = read_json(JOBS / key / "signals.json", {}) if key else None
+    words = read_json(JOBS / key / "transcript.json", []) if key else []
+    has_chat = bool(r and r.get("counts"))
+    has_voice = bool(sg and sg.get("db"))
+    if not has_chat and not has_voice:
+        return ('<div class="np-chart np-chart-empty"><p>Activity shows here once a stream has been read.</p></div>')
+    b = float((r or sg)["bin"])
+    n = max(len(r["counts"]) if has_chat else 0, len(sg["db"]) if has_voice else 0)
     dur = n * b
-    k = max(1, round(30 / b))                      # 30 s rolling window, shown as messages per minute
-    pm, run = [], 0.0
-    for i, c in enumerate(counts):
-        run += c
-        if i >= k:
-            run -= counts[i - k]
-        pm.append(run / (min(i + 1, k) * b) * 60)
     cols = min(900, n)
-    per = n / cols
-    ys = [max(pm[int(i * per):max(int((i + 1) * per), int(i * per) + 1)]) for i in range(cols)]
-    avg = float(r["avg"]) * 60 / b
-    top = max(max(ys), 2 * avg) * 1.08 or 1.0
-
-    def Y(v):
-        return 100 - v / top * 100
-    pts = [f"{(i + 0.5) / cols * 1000:.1f},{Y(v):.2f}" for i, v in enumerate(ys)]
-    line = "M" + " L".join(pts)
-    area = f"M0,100 L{' L'.join(pts)} L1000,100 Z"
+    layers, lines, ylabs = [], "", ""
+    if has_chat:
+        counts = r["counts"]
+        k = max(1, round(30 / b))                  # 30 s rolling window, shown as messages per minute
+        pm, run = [], 0.0
+        for i, c in enumerate(counts):
+            run += c
+            if i >= k:
+                run -= counts[i - k]
+            pm.append(run / (min(i + 1, k) * b) * 60)
+        pm += [0.0] * (n - len(pm))
+        ys = _down(pm, cols)
+        avg = float(r["avg"]) * 60 / b
+        top = max(max(ys), 2 * avg) * 1.08 or 1.0
+        pts = _series_path(ys, top, cols)
+        layers.append(f'<path class="area" d="M0,100 L{" L".join(pts)} L1000,100 Z"/><path class="trace" d="M{" L".join(pts)}"/>')
+        ya, ys2 = 100 - avg / top * 100, 100 - 2 * avg / top * 100
+        lines = (f'<line class="avg" x1="0" x2="1000" y1="{ya:.2f}" y2="{ya:.2f}"/>'
+                 f'<line class="spk" x1="0" x2="1000" y1="{ys2:.2f}" y2="{ys2:.2f}"/>')
+        ylabs = (f'<span class="spk" style="top:{ys2:.2f}%">Spike line {2 * avg:.0f}/min</span>'
+                 f'<span class="avg" style="top:{ya:.2f}%">Average {avg:.0f}/min</span>')
+    if has_voice:
+        _, _, above = signals.audio_excite(sg["db"], n)
+        v = [max(0.0, float(x)) for x in above]
+        vs = _down(v, cols)
+        vtop = max(max(vs), signals.AUDIO_DB * 1.6, 1.0)
+        pts = _series_path(vs, vtop, cols)
+        cls = "voice" if has_chat else "voice main"
+        if not has_chat:
+            layers.append(f'<path class="area voice-area" d="M0,100 L{" L".join(pts)} L1000,100 Z"/>')
+        layers.append(f'<path class="{cls}" d="M{" L".join(pts)}"/>')
+        yl = 100 - signals.AUDIO_DB / vtop * 100
+        if not has_chat:
+            lines += f'<line class="spk" x1="0" x2="1000" y1="{yl:.2f}" y2="{yl:.2f}"/>'
+            ylabs += f'<span class="spk" style="top:{yl:.2f}%">Loud: +{signals.AUDIO_DB:.0f} dB</span>'
+    ticks_said = ""
+    if words:
+        _, _, said = signals.speech_excite(words, n, (read_json(JOBS / key / "job.json", {}) or {}).get("keywords", ""))
+        ticks_said = "".join(f'<i style="left:{(i + 0.5) / n * 100:.2f}%" title="{esc(", ".join(x))}"></i>'
+                             for i, x in enumerate(said) if x)
     bands, flags = [], []
     for c in clips_of(key):
         x0 = max(0.0, c["start"] / dur * 1000)
@@ -140,41 +181,40 @@ def chart_html(key, sel=None):
         bands.append(f'<rect class="band{on}" x="{x0:.1f}" y="0" width="{w:.1f}" height="100"/>')
         mid = min(99.0, max(1.0, (x0 + w / 2) / 10))
         flags.append(f'<button class="np-flag{on}" data-clip="{c["id"]}" style="left:{mid:.2f}%" '
-                     f'title="Clip {c["id"]} at {esc(c["vod_time"])}, {c["multiple"]}× average">{c["id"]}</button>')
+                     f'title="Clip {c["id"]} at {esc(c["vod_time"])}">{c["id"]}</button>')
     step = _tick_step(dur)
     ticks = "".join(f'<span style="left:{t / dur * 100:.2f}%">{fmt_t(t)}</span>'
                     for t in range(0, int(dur) + 1, step) if t / dur <= 0.97)
-    ya, ys2 = Y(avg), Y(2 * avg)
-    if (read_json(JOBS / key / "job.json", {}) or {}).get("live"):
-        cap = ("Chat messages per minute since Clipper started watching. Shaded parts are the clips, numbered in the "
-               "order they happened. Click a number to open that clip.")
-    else:
-        cap = ("Chat messages per minute across the whole stream. Shaded parts are the clips, numbered by rank. "
-               "Click a number to open that clip.")
+    legend = []
+    if has_chat:
+        legend.append('<span><i class="k-chat"></i>Chat messages per minute</span>')
+    if has_voice:
+        legend.append('<span><i class="k-voice"></i>Streamer\'s voice above their usual level</span>')
+    if ticks_said:
+        legend.append('<span><i class="k-said"></i>Reaction phrases said</span>')
+    legend.append('<span><i class="k-clip"></i>Clips (click a number to open)</span>')
+    live_job = (read_json(JOBS / key / "job.json", {}) or {}).get("live")
+    when = "since Clipper started watching" if live_job else "across the whole stream"
     return f"""<div class="np-chart">
   <div class="np-flags">{''.join(flags)}</div>
   <div class="np-plotwrap">
     <div class="np-plot">
       <svg viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
-        {''.join(bands)}
-        <path class="area" d="{area}"/>
-        <path class="trace" d="{line}"/>
-        <line class="avg" x1="0" x2="1000" y1="{ya:.2f}" y2="{ya:.2f}"/>
-        <line class="spk" x1="0" x2="1000" y1="{ys2:.2f}" y2="{ys2:.2f}"/>
+        {''.join(bands)}{''.join(layers)}{lines}
       </svg>
+      <div class="np-said">{ticks_said}</div>
     </div>
-    <div class="np-ylab">
-      <span class="spk" style="top:{ys2:.2f}%">Spike line {2 * avg:.0f}/min</span>
-      <span class="avg" style="top:{ya:.2f}%">Average {avg:.0f}/min</span>
-    </div>
+    <div class="np-ylab">{ylabs}</div>
   </div>
   <div class="np-ticks">{ticks}</div>
-  <p class="np-cap">{cap}</p>
+  <div class="np-legend">{''.join(legend)}<span class="when">Times {when}</span></div>
 </div>"""
 
 
 def list_html(key, sel=None):
     cs = clips_of(key)
+    if not key:
+        return '<div class="np-list np-list-empty"><p>Open a stream from the list on the left to see its clips.</p></div>'
     if not cs:
         return ('<div class="np-list np-list-empty"><p>No clips yet. They appear here, best first, as soon as the '
                 'chat has been read.</p></div>')
@@ -184,16 +224,71 @@ def list_html(key, sel=None):
         on = " on" if sel is not None and c["id"] == sel else ""
         what = (f'<p class="what">{esc(c["what"])}</p>' if c.get("what")
                 else '<p class="what none">Not described yet. Run /clip in Claude Code to write what happens.</p>')
-        rows.append(f"""<button class="np-row{on}" data-clip="{c['id']}">
-  <span class="rank">{c['id']}</span>
-  <span class="score"><b>{c['score']}</b><small>score</small></span>
-  <span class="body">
-    <span class="facts"><b>{c['multiple']}× average</b><span>at {esc(c['vod_time'])}</span><span>{round(c['end'] - c['start'])} s</span><span>{c['unique_chatters']} chatters</span></span>
-    {what}
-  </span>
-  <span class="pill {cls}">{label}</span>
-</button>""")
-    return f'<div class="np-list">{"".join(rows)}</div>'
+        rows.append(f"""<div class="np-row{on}">
+  <label class="np-tick" title="Select clip {c['id']}"><input type="checkbox" class="np-pick" data-id="{c['id']}" aria-label="Select clip {c['id']}"></label>
+  <button class="np-open" data-clip="{c['id']}" aria-label="Open clip {c['id']}">
+    <span class="rank">{c['id']}</span>
+    <span class="score"><b>{c['score']}</b><small>score</small></span>
+    <span class="body">
+      <span class="facts">{_row_facts(c)}</span>
+      {what}
+    </span>
+    <span class="pill {cls}">{label}</span>
+  </button>
+</div>""")
+    return f"""<div class="np-list">
+  <div class="np-bulk"><label class="np-tick"><input type="checkbox" class="np-all" aria-label="Select all clips"></label>
+    <span class="np-count">{len(cs)} clip{'' if len(cs) == 1 else 's'}, best first</span>
+    <button class="np-bulk-del" disabled>Delete selected</button></div>
+  {''.join(rows)}
+</div>"""
+
+
+def _basis_tags(c):
+    return "".join(f'<span class="by by-{b}">{signals.NAMES[b]}</span>' for b in c.get("basis", ["chat"]))
+
+
+def _row_facts(c):
+    out = [_basis_tags(c)]
+    if c.get("multiple"):
+        out.append(f"<b>{c['multiple']}× chat</b>")
+    out.append(f"<span>at {esc(c['vod_time'])}</span><span>{round(c['end'] - c['start'])} s</span>")
+    if c.get("unique_chatters"):
+        out.append(f"<span>{c['unique_chatters']} chatter{'' if c['unique_chatters'] == 1 else 's'}</span>")
+    return "".join(out)
+
+
+def sidebar_html(cur=None):
+    jds = sorted([p for p in JOBS.iterdir() if (p / "job.json").exists()], key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jds:
+        return ('<div class="sb"><div class="sb-head"><h3>Streams</h3></div><p class="sb-empty">No streams yet. Paste a '
+                'stream link above and press Find clips.</p></div>')
+    rows = []
+    for jd in jds:
+        c = read_json(jd / "clips.json", {}) or {}
+        st = read_json(jd / "status.json", {}) or {}
+        k = len(c.get("clips", []))
+        on = " on" if jd.name == cur else ""
+        if live.running(jd):
+            tag = '<span class="sb-tag live">Live</span>'
+        elif st.get("error"):
+            tag = '<span class="sb-tag err">Stopped</span>'
+        elif st.get("stage") not in (None, "", "done"):
+            tag = '<span class="sb-tag run">Working</span>'
+        else:
+            tag = ""
+        plat = PLATFORM.get(c.get("platform") or (read_json(jd / "job.json", {}) or {}).get("platform"), "")
+        meta = ", ".join(x for x in (plat, f"{k} clip{'' if k == 1 else 's'}", library.human(library.size_of(jd))) if x)
+        rows.append(f"""<div class="sb-row{on}">
+  <label class="np-tick"><input type="checkbox" class="np-pick" data-id="{esc(jd.name)}" aria-label="Select {esc(c.get('title') or jd.name)}"></label>
+  <button class="sb-open" data-key="{esc(jd.name)}"><span class="t">{tag}{esc(c.get('title') or jd.name)}</span><span class="m">{meta}</span></button>
+</div>""")
+    return f"""<div class="sb">
+  <div class="sb-head"><h3>Streams</h3><span>{len(jds)}</span></div>
+  <div class="sb-list">{''.join(rows)}</div>
+  <div class="np-bulk"><label class="np-tick"><input type="checkbox" class="np-all" aria-label="Select all streams"></label>
+    <span class="np-count">Tick streams to delete them</span><button class="np-bulk-del" disabled>Delete selected</button></div>
+</div>"""
 
 
 REACT = {"laugh": "Laughing", "hype": "Hype", "shock": "Shock", "clip": "“Clip it”", "sad": "Sad"}
@@ -206,23 +301,38 @@ def card_html(key, n, note=""):
                 'why it was picked.</p></div>')
     why = esc(c.get("why")) if c.get("why") else f'{esc(c["auto_reason"])} <em>Automatic summary. Run /clip for Claude\'s read.</em>'
     what = esc(c["what"]) if c.get("what") else "<em>Not written yet. Run /clip in Claude Code.</em>"
-    sig = "".join(f'<span class="chip">{REACT.get(k, esc(k))} <b>{v}</b></span>' for k, v in c["signals"].items() if v) \
-        or '<span class="muted">None picked up</span>'
-    words = "".join(f'<span class="chip">{esc(w)}</span>' for w in c["top_words"][:8])
-    facts = [("Peak", f"{c['peak_per_min']:.0f} msgs/min"), ("Stream average", f"{c['avg_per_min']:.0f} msgs/min"),
-             ("Chatters", c["unique_chatters"]), ("Messages", c["messages"]),
-             ("Starts at", esc(c["vod_time"])), ("Length", f"{round(c['end'] - c['start'])} s")]
+    basis = c.get("basis", ["chat"])
+    sub = c.get("sub") or {"chat": c["score"]}
+    subs = "".join(f'<span class="chip sc"><b>{v}</b> {signals.NAMES[k]}</span>' for k, v in sub.items())
+    if c.get("multiple"):
+        headline = f"<b>{c['multiple']}×</b> the stream's average chat"
+    else:
+        headline = "Found by " + " and ".join(signals.NAMES[b].lower() for b in basis)
+    facts = [("Starts at", esc(c["vod_time"])), ("Length", f"{round(c['end'] - c['start'])} s")]
+    if c.get("messages"):
+        facts = [("Peak chat", f"{c['peak_per_min']:.0f}/min"), ("Stream average", f"{c['avg_per_min']:.0f}/min"),
+                 ("Chatters", c["unique_chatters"]), ("Messages", c["messages"])] + facts
     dl = "".join(f"<div><dt>{a}</dt><dd>{b}</dd></div>" for a, b in facts)
+    sig = "".join(f'<span class="chip">{REACT.get(k, esc(k))} <b>{v}</b></span>' for k, v in c["signals"].items() if v)
+    words = "".join(f'<span class="chip">{esc(w)}</span>' for w in c["top_words"][:8])
+    said = "".join(f'<span class="chip said">“{esc(w)}”</span>' for w in c.get("said", []))
+    extra = ""
+    if said:
+        extra += f"<h4>The streamer said</h4><div class='chips'>{said}</div>"
+    if sig:
+        extra += f"<h4>Chat reactions</h4><div class='chips'>{sig}</div>"
+    if words:
+        extra += f"<h4>Chat kept saying</h4><div class='chips'>{words}</div>"
     return f"""<div class="np-card">
   <div class="np-card-top">
     <div class="np-score"><b>{c['score']}</b><span>/100</span></div>
-    <div><p class="mult"><b>{c['multiple']}×</b> the stream's average chat</p><p class="muted">Clip {c['id']}, ranked by score</p></div>
+    <div><p class="mult">{headline}</p><p class="muted">Clip {c['id']}</p></div>
   </div>
+  <h4>Score by signal</h4><div class="chips">{subs}</div>
   <dl class="np-facts">{dl}</dl>
   <h4>What happens</h4><p>{what}</p>
   <h4>Why it could go viral</h4><p>{why}</p>
-  <h4>Chat reactions</h4><div class="chips">{sig}</div>
-  <h4>Chat kept saying</h4><div class="chips">{words}</div>
+  {extra}
   {f'<p class="np-note">{note}</p>' if note else ''}
 </div>"""
 
@@ -314,7 +424,12 @@ def boxes(frame, e):
 
 
 # ---------------- actions ----------------
-def start_analysis(url, top_n, cookies, chat_file, hours):
+def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
+    basis = [b for b in ("chat", "audio", "speech") if b in (basis or [])]
+    if not basis:
+        raise gr.Error("Pick at least one way to find clips: chat spikes, loud voice or what's said.")
+    if "speech" in basis and not stt.available():
+        raise gr.Error("Finding clips by what's said needs the speech-to-text model. In a terminal run: clipper stt-download")
     try:
         target = live.probe(url or "")
     except live.NotLive as e:
@@ -322,10 +437,10 @@ def start_analysis(url, top_n, cookies, chat_file, hours):
     except Exception as e:
         raise gr.Error(f"Couldn't check that link: {e}")
     if target:
-        jd = live.new_job(target, hours=float(hours or 6))
+        jd = live.new_job(target, hours=float(hours or 6), basis=basis, keywords=keywords or "")
         live.start_process(jd)
         gr.Info(f"Watching {target.get('channel') or target['id']} live. Clips appear as chat spikes.")
-        return gr.update(choices=job_choices(), value=jd.name)
+        return jd.name
     try:
         platform, vid = detect(url or "")
     except ValueError as e:
@@ -345,26 +460,32 @@ def start_analysis(url, top_n, cookies, chat_file, hours):
     def work():
         with LOCK:
             try:
-                pipeline.analyze(url, top_n=int(top_n), cookies_browser=cookies or None, chat_file=cf)
+                pipeline.analyze(url, top_n=int(top_n), cookies_browser=cookies or None, chat_file=cf, basis=basis,
+                                 keywords=keywords or "")
             except Exception:
                 pass                       # the error is in status.json
     threading.Thread(target=work, daemon=True).start()
-    return gr.update(choices=job_choices(), value=key)
+    return key
 
 
 def _stop_btn(key):
     return gr.update(visible=bool(key) and live.running(JOBS / key))
 
 
+def _del_btn(key):
+    return gr.update(visible=bool(key) and (JOBS / key).exists())
+
+
 def refresh_job(key, sel=None):
+    """Everything about the open stream (timer + after changes). Keeps the open clip."""
     return (status_html(key), chart_html(key, sel), list_html(key, sel), gr.update(choices=clip_choices(key)),
-            _stop_btn(key))
+            _stop_btn(key), _del_btn(key), sidebar_html(key))
 
 
 def switch_job(key):
-    """New stream picked: fresh view, no clip open."""
+    """Another stream opened: fresh view, no clip open."""
     return (status_html(key), chart_html(key), list_html(key), gr.update(choices=clip_choices(key), value=None),
-            _stop_btn(key))
+            _stop_btn(key), _del_btn(key), sidebar_html(key))
 
 
 def stop_live(key):
@@ -383,7 +504,7 @@ def tick(key, sel):
     sig = ((st or {}).get("stage"), (st or {}).get("pct"), (st or {}).get("msg"),
            (JOBS / key / "clips.json").stat().st_mtime if key and (JOBS / key / "clips.json").exists() else 0)
     if not key or _SETTLED.get(key) == sig:
-        return gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return (gr.skip(),) * 7
     if sig[0] in ("done", "error"):
         _SETTLED[key] = sig
     return refresh_job(key, sel)
@@ -391,14 +512,85 @@ def tick(key, sel):
 
 def first_load(key):
     _SETTLED.pop(key, None)
-    return refresh_job(key)
+    return switch_job(key)
 
 
-def pick_clip(evt: gr.EventData):
-    n = getattr(evt, "clip", None)
-    if n is None:
-        n = (getattr(evt, "_data", None) or {}).get("clip")
-    return gr.skip() if n is None else int(n)
+def _evt(evt):
+    d = dict(getattr(evt, "_data", None) or {})
+    for k in ("action", "id", "ids", "key"):
+        if k not in d and hasattr(evt, k):
+            d[k] = getattr(evt, k)
+    return d
+
+
+def _ask(kind, ids, key=None):
+    """Fill the confirm dialog for deleting streams or clips."""
+    if kind == "streams":
+        size = sum(library.size_of(JOBS / k) for k in ids)
+        names = [(read_json(JOBS / k / "clips.json", {}) or {}).get("title") or k for k in ids]
+        head = f"Delete {len(ids)} stream{'' if len(ids) == 1 else 's'}?"
+        body = ("Each goes with all its clips, Shorts and memes. " if len(ids) > 1 else
+                f"“{esc(names[0])}” goes with all its clips, Shorts and memes. ")
+    else:
+        size = sum(library.size_of(JOBS / key / "clips" / str(i)) for i in ids)
+        head = f"Delete {len(ids)} clip{'' if len(ids) == 1 else 's'}?"
+        body = f"Clip{'' if len(ids) == 1 else 's'} {', '.join(str(i) for i in sorted(ids))}, with Shorts and memes. "
+    where = (("It goes" if len(ids) == 1 else "They go") + " to the Trash, so you can still get "
+             + ("it" if len(ids) == 1 else "them") + " back.") if library.TRASH.is_dir() else "This can't be undone."
+    return (kind, list(ids), gr.update(visible=True),
+            f'<h3>{head}</h3><p>{body}{library.human(size)} in all. {where}</p>')
+
+
+def side_click(evt: gr.EventData):
+    d = _evt(evt)
+    if d.get("action") == "delete" and d.get("ids"):
+        return (gr.skip(),) + _ask("streams", d["ids"])
+    if d.get("action") == "open" and d.get("id"):
+        return (d["id"],) + (gr.skip(),) * 4
+    return (gr.skip(),) * 5
+
+
+def list_click(key, evt: gr.EventData):
+    d = _evt(evt)
+    if d.get("action") == "delete" and d.get("ids") and key:
+        return (gr.skip(),) + _ask("clips", [int(i) for i in d["ids"]], key)
+    if d.get("action") == "open" and d.get("id") is not None:
+        return (int(d["id"]),) + (gr.skip(),) * 4
+    return (gr.skip(),) * 5
+
+
+def ask_stream(key):
+    if not key:
+        raise gr.Error("Open a stream first.")
+    return _ask("streams", [key])
+
+
+def ask_clip(key, n):
+    if not key or n is None:
+        raise gr.Error("Open a clip first.")
+    return _ask("clips", [int(n)], key)
+
+
+def do_delete(kind, ids, key, n):
+    """Confirmed: delete, then refresh everything that showed the deleted items."""
+    hide = gr.update(visible=False)
+    if kind == "streams":
+        done, skipped = library.delete_streams(ids or [])
+        left = [k for _, k in job_choices()]
+        new = key if key in left else (left[0] if left else "")
+        msgs = [f"Deleted {len(done)} stream{'' if len(done) == 1 else 's'}."] if done else []
+    else:
+        done, skipped = library.delete_clips(key, ids or [])
+        new = key
+        msgs = [f"Deleted {len(done)} clip{'' if len(done) == 1 else 's'}."] if done else []
+    msgs += [f"Skipped {k}: {why}." for k, why in skipped]
+    if done:
+        gr.Info(" ".join(msgs))
+    elif msgs:
+        gr.Warning(" ".join(msgs))
+    keep = n if kind == "clips" and n not in (done or []) else (n if new == key else None)
+    return (hide, new, gr.update(choices=clip_choices(new), value=keep if new == key else None),
+            *refresh_job(new, keep if new == key else None)[:3], sidebar_html(new), _del_btn(new))
 
 
 def highlight(key, n):
@@ -584,83 +776,16 @@ def meme_save(key, n, item, top, bottom):
             gr.update(value=got, visible=True))
 
 
-# ---------------- library: delete streams and clips ----------------
-def _trash_note(n=2):
-    if not library.TRASH.is_dir():
-        return "This can't be undone."
-    return "It goes to the Trash, so you can still get it back." if n == 1 else \
-        "They go to the Trash, so you can still get them back."
-
-
-def lib_stream_choices():
-    out = []
-    for jd in sorted([p for p in JOBS.iterdir() if (p / "job.json").exists()], key=lambda p: p.stat().st_mtime, reverse=True):
-        c = read_json(jd / "clips.json", {}) or {}
-        k = len(c.get("clips", []))
-        tag = ", watching live" if live.running(jd) else ""
-        out.append((f"{c.get('title') or jd.name} ({k} clip{'' if k == 1 else 's'}, "
-                    f"{library.human(library.size_of(jd))}{tag})", jd.name))
-    return out
-
-
-def lib_clip_choices(key):
-    out = []
-    for c in clips_of(key):
-        cd = JOBS / key / "clips" / str(c["id"])
-        out.append((f"Clip {c['id']} at {c['vod_time']}, score {c['score']} ({library.human(library.size_of(cd))})",
-                    c["id"]))
-    return out
-
-
-def lib_refresh(key):
-    return (gr.update(choices=lib_stream_choices(), value=[]), gr.update(choices=lib_clip_choices(key), value=[]),
-            gr.update(visible=False), gr.update(visible=False))
-
-
-def ask_streams(keys):
-    if not keys:
-        raise gr.Error("Tick at least one stream first.")
-    size = sum(library.size_of(JOBS / k) for k in keys)
-    return (f'<div class="np-note np-err"><b>Delete {len(keys)} stream{"" if len(keys) == 1 else "s"} and all their '
-            f'clips ({library.human(size)})?</b> {_trash_note(len(keys))}</div>', gr.update(visible=True))
-
-
-def ask_clips(key, ids):
-    if not key or not ids:
-        raise gr.Error("Tick at least one clip first.")
-    size = sum(library.size_of(JOBS / key / "clips" / str(i)) for i in ids)
-    return (f'<div class="np-note np-err"><b>Delete {len(ids)} clip{"" if len(ids) == 1 else "s"} '
-            f'({library.human(size)})?</b> {_trash_note(len(ids))}</div>', gr.update(visible=True))
-
-
-def _result(done, skipped, what):
-    msg = f"Deleted {len(done)} {what}{'' if len(done) == 1 else 's'}." if done else ""
-    if skipped:
-        msg += " Skipped " + ", ".join(f"{k}: {why}" for k, why in skipped) + "."
-    return f'<div class="np-note{" np-ok" if done and not skipped else ""}">{esc(msg.strip())}</div>'
-
-
-def do_delete_streams(keys, cur):
-    done, skipped = library.delete_streams(keys or [])
-    choices = job_choices()
-    new = cur if cur not in done else (choices[0][1] if choices else None)
-    return (gr.update(choices=choices, value=new), gr.update(value=None) if cur in done else gr.update(),
-            _result(done, skipped, "stream"), *lib_refresh(new))
-
-
-def do_delete_clips(key, ids, cur_clip):
-    done, skipped = library.delete_clips(key, ids or [])
-    gone = cur_clip is not None and cur_clip in done
-    return (gr.update(choices=clip_choices(key), value=None if gone else cur_clip), list_html(key, None if gone else cur_clip),
-            chart_html(key, None if gone else cur_clip), _result(done, skipped, "clip"), *lib_refresh(key))
-
-
 # ---------------- UI ----------------
-# Look: cool light grey ground, white sheets, ink text, one "heat" colour for spikes and scores.
-# Instrument Sans throughout (condensed width for big numbers). Nothing moves: no animations or transitions.
-FONT_URL = "https://fonts.googleapis.com/css2?family=Instrument+Sans:wdth,wght@75..100,400..700&display=swap"
-HEAD = (f'<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
-        f'<link rel="stylesheet" href="{FONT_URL}"><meta name="color-scheme" content="light">')
+# Look: cool light grey ground, white sheets, ink text, one "heat" colour for spikes, scores and deleting.
+# Instrument Sans (SIL OFL, bundled in clipper/assets) throughout, condensed for big numbers. Nothing moves.
+import base64 as _b64
+_FONT = Path(__file__).with_name("assets") / "InstrumentSans.ttf"
+FONT_FACE = (f"@font-face {{ font-family: 'Instrument Sans'; font-style: normal; font-weight: 400 700; "
+             f"font-stretch: 75% 100%; font-display: block; "
+             f"src: url(data:font/ttf;base64,{_b64.b64encode(_FONT.read_bytes()).decode()}) format('truetype'); }}"
+             if _FONT.exists() else "")
+HEAD = '<meta name="color-scheme" content="light">'
 FORCE_LIGHT = "() => { document.body.classList.remove('dark'); document.documentElement.classList.remove('dark'); }"
 
 INK, MUTED, RULE, SHEET, SUNK, GROUND, HEAT = "#181B21", "#646C79", "#D9DDE3", "#FFFFFF", "#F5F6F8", "#ECEEF1", "#E5432E"
@@ -706,47 +831,94 @@ THEME = gr.themes.Base(
     loader_color=MUTED, stat_background_fill=SUNK,
 )
 
-CSS = """
+
+CSS = FONT_FACE + """
 /* nothing moves */
 *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
-.eta-bar, .progress-level-inner + .progress-bar { display: none !important; }
+.eta-bar { display: none !important; }
 
-:root { --ink:#181B21; --muted:#646C79; --rule:#D9DDE3; --sheet:#FFFFFF; --sunk:#F5F6F8; --ground:#ECEEF1;
-        --heat:#E5432E; --heat-soft:#FCE6E2; --ok:#1E8A52; --ok-soft:#E3F3EA; --wait:#9A6B00; --wait-soft:#FBF1D9; }
+:root { --ink:#181B21; --muted:#646C79; --faint:#8D94A0; --rule:#D9DDE3; --sheet:#FFFFFF; --sunk:#F5F6F8; --ground:#ECEEF1;
+        --heat:#E5432E; --heat-ink:#B5321F; --heat-soft:#FCE6E2; --ok:#1E7A4A; --ok-soft:#E3F3EA; --wait:#8A6100; --wait-soft:#FBF1D9;
+        --r-lg:12px; --r-md:8px; --r-sm:6px; }
 body, .gradio-container { background: var(--ground) !important; font-feature-settings: "tnum" 1; }
-.gradio-container { max-width: 1360px !important; margin: 0 auto !important; padding: 28px 32px 48px !important; }
+.gradio-container { max-width: 1520px !important; margin: 0 auto !important; padding: 20px 24px 48px !important; }
 footer { display: none !important; }
 :focus-visible { outline: 2px solid var(--ink) !important; outline-offset: 2px; }
-.prose, .prose p { font-size: 15px; line-height: 1.55; }
-
 .html-container { padding: 0 !important; }
+.np-hide { display: none !important; }
+button, [role="button"], .np-open, .sb-open, label.np-tick { cursor: pointer; }
 
-/* masthead */
-#np-mast { align-items: flex-start; gap: 32px; margin: 0 0 8px; }
-#np-brand h1 { font-size: 40px; line-height: 1; font-weight: 700; font-stretch: 75%; letter-spacing: -0.01em; margin: 0 0 8px; color: var(--ink); }
-#np-brand p { margin: 0; color: var(--muted); font-size: 15px; max-width: 44ch; }
-#np-find { gap: 10px; align-items: stretch; margin-top: 4px; }
-#np-find button { min-height: 48px; }
-#np-url, #np-url label, #np-url .input-container { height: 100%; }
-#np-url input, #np-url textarea { font-size: 15px; height: 48px; background: var(--sheet) !important; border-color: #C9CED6 !important; }
-#np-url input:focus { border-color: var(--ink) !important; }
-#np-opts { background: transparent !important; border: 0 !important; padding: 6px 0 0 !important; }
-#np-opts > button, #np-opts .label-wrap { padding: 4px 0 !important; justify-content: flex-start !important; gap: 6px; width: auto !important; }
+/* ---------- shell: sidebar + main ---------- */
+#np-shell { gap: 20px; align-items: flex-start; flex-wrap: nowrap; }
+#np-side { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow-y: auto; gap: 10px; flex-wrap: nowrap !important;
+  background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r-lg); padding: 18px 16px 16px !important; }
+#np-main { gap: 16px; min-width: 0; }
+@media (max-width: 980px) {
+  #np-shell { flex-wrap: wrap; }
+  #np-side { position: static; max-height: none; width: 100% !important; flex: 1 1 100% !important; }
+}
+
+/* brand + find */
+#np-brand h1 { font-size: 34px; line-height: 1; font-weight: 700; font-stretch: 75%; letter-spacing: -0.01em; margin: 0 0 6px; color: var(--ink); }
+#np-brand p { margin: 0 0 4px; color: var(--muted); font-size: 14px; line-height: 1.45; }
+#np-url input, #np-url textarea { font-size: 15px; height: 46px; background: var(--sunk) !important; border-color: #C9CED6 !important; }
+#np-url input:focus { border-color: var(--ink) !important; background: var(--sheet) !important; }
+#np-go { min-height: 46px; }
+#np-opts { background: transparent !important; border: 0 !important; padding: 0 !important; }
+#np-opts > button, #np-opts .label-wrap { padding: 2px 0 !important; justify-content: flex-start !important; gap: 6px; width: auto !important; }
 #np-opts .label-wrap span, #np-opts > button span { font-size: 13.5px; color: var(--muted); font-weight: 500; }
 #np-opts .icon { order: -1; margin: 0 !important; }
 
-/* stream bar */
-#np-bar { align-items: stretch; }
-.np-status { padding: 2px 2px 0; }
-.np-status h2 { font-size: 26px; line-height: 1.15; font-weight: 700; font-stretch: 85%; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+/* sidebar stream list */
+.sb { border-top: 1px solid var(--rule); margin-top: 6px; padding-top: 14px; }
+.sb-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+.sb-head h3 { margin: 0; font-size: 15px; font-weight: 650; color: var(--ink); }
+.sb-head span { font-size: 13px; color: var(--muted); }
+.sb-empty { margin: 0; font-size: 14px; color: var(--muted); line-height: 1.5; }
+.sb-list { display: flex; flex-direction: column; gap: 2px; }
+.sb-row { display: flex; align-items: flex-start; gap: 4px; border-radius: var(--r-md); border-left: 3px solid transparent; padding: 2px 0; }
+.sb-row:hover { background: var(--sunk); }
+.sb-row.on { background: var(--sunk); border-left-color: var(--heat); }
+.sb-row.picked { background: var(--heat-soft); }
+.sb-open { all: unset; box-sizing: border-box; flex: 1; min-width: 0; padding: 8px 8px 8px 2px; display: flex; flex-direction: column; gap: 3px; }
+.sb-open .t { font-size: 14px; font-weight: 600; color: var(--ink); line-height: 1.3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.sb-open .m { font-size: 12.5px; color: var(--muted); }
+.sb-open:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; border-radius: var(--r-sm); }
+.sb-tag { display: inline-block; font-size: 11.5px; font-weight: 650; padding: 1px 6px; border-radius: 4px; margin-right: 6px; vertical-align: 1px; }
+.sb-tag.live { background: var(--heat); color: #fff; }
+.sb-tag.err { background: var(--heat-soft); color: var(--heat-ink); }
+.sb-tag.run { background: var(--wait-soft); color: var(--wait); }
+
+/* checkboxes + bulk bar (sidebar and clip list) */
+label.np-tick { display: grid; place-items: center; width: 36px; min-height: 36px; flex: none; }
+.np-tick input { width: 17px; height: 17px; accent-color: var(--heat); margin: 0; }
+.np-bulk { display: flex; align-items: center; gap: 8px; padding: 8px 10px 8px 0; }
+.sb .np-bulk { border-top: 1px solid var(--rule); margin-top: 8px; padding-top: 10px; }
+.np-count { flex: 1; font-size: 13.5px; color: var(--muted); }
+.np-bulk-del { all: unset; font: 600 13.5px "Instrument Sans", sans-serif; color: #fff; background: var(--heat); padding: 7px 12px; border-radius: var(--r-sm); }
+.np-bulk-del:disabled { background: var(--sunk); color: var(--faint); border: 1px solid var(--rule); padding: 6px 11px; cursor: default; }
+.np-bulk-del:not(:disabled):hover { background: #C93422; }
+.np-bulk-del:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* ---------- main: header ---------- */
+#np-head { align-items: flex-start; gap: 16px; }
+#np-actions { gap: 8px; align-items: stretch; }
+.np-status { padding: 4px 2px 0; }
+.np-status h2 { font-size: 28px; line-height: 1.15; font-weight: 700; font-stretch: 85%; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
 .np-st-title p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
-.np-empty p { color: var(--muted); max-width: 64ch; margin: 6px 0 0; font-size: 15px; }
-.np-stats { display: flex; flex-wrap: wrap; gap: 0; margin: 18px 0 0; padding: 0; }
-.np-stats > div { padding: 0 28px 0 0; margin-right: 28px; border-right: 1px solid var(--rule); }
+.np-empty h2 { margin-bottom: 6px; }
+.np-empty p { color: var(--muted); max-width: 62ch; margin: 0; font-size: 15px; line-height: 1.55; }
+.np-stats { display: flex; flex-wrap: wrap; gap: 12px 0; margin: 16px 0 0; padding: 0; }
+.np-stats > div { padding: 0 24px 0 0; margin-right: 24px; border-right: 1px solid var(--rule); }
 .np-stats > div:last-child { border-right: 0; }
 .np-stats dt { font-size: 13px; color: var(--muted); margin: 0 0 2px; }
 .np-stats dd { margin: 0; font-size: 24px; font-weight: 650; font-stretch: 80%; color: var(--ink); }
 .np-stats dd small { font-size: 14px; font-weight: 500; color: var(--muted); font-stretch: 100%; }
+.np-live { display: inline-block; vertical-align: 5px; margin-right: 10px; font: 600 13px/1 "Instrument Sans", sans-serif; font-stretch: 100%; color: #fff; background: var(--heat); padding: 5px 8px 5px 20px; border-radius: 5px; position: relative; }
+.np-live::before { content: ""; position: absolute; left: 8px; top: 50%; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: #fff; }
+.np-live.off { background: var(--sunk); color: var(--muted); border: 1px solid var(--rule); }
+.np-live.off::before { background: var(--muted); }
+.np-livemsg { margin: 12px 0 0; font-size: 14px; color: var(--muted); }
 
 /* progress (static) */
 .np-run { margin-top: 16px; max-width: 560px; }
@@ -757,24 +929,29 @@ footer { display: none !important; }
 .np-run p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
 
 /* notes */
-.np-note { margin: 14px 0 0; padding: 10px 14px; border-radius: 8px; background: var(--sunk); border: 1px solid var(--rule); font-size: 14px; line-height: 1.5; color: var(--ink); }
+.np-note { margin: 14px 0 0; padding: 10px 14px; border-radius: var(--r-md); background: var(--sunk); border: 1px solid var(--rule); font-size: 14px; line-height: 1.5; color: var(--ink); }
 .np-note.np-err { background: var(--heat-soft); border-color: #F2B8AE; }
 .np-note.np-ok { background: var(--ok-soft); border-color: #B5DEC6; }
 .np-note pre { white-space: pre-wrap; font-size: 12px; margin: 8px 0 0; max-height: 220px; overflow: auto; }
 .np-note a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
 
-/* the chart: the one loud thing */
-#np-chartbox { padding: 18px 20px 14px !important; }
+/* buttons */
+.np-danger { background: var(--heat) !important; border-color: var(--heat) !important; color: #fff !important; }
+.np-danger:hover { background: #C93422 !important; border-color: #C93422 !important; }
+.np-danger-soft { color: var(--heat-ink) !important; }
+.np-danger-soft:hover { background: var(--heat-soft) !important; border-color: #F2B8AE !important; }
+
+/* ---------- chart ---------- */
+#np-chartbox { padding: 18px 20px 14px !important; border-radius: var(--r-lg) !important; }
 .np-chart { position: relative; }
-.np-chart-empty { height: 180px; display: grid; place-items: center; background: var(--sunk); border-radius: 8px; }
+.np-chart-empty { height: 160px; display: grid; place-items: center; background: var(--sunk); border-radius: var(--r-md); }
 .np-chart-empty p { color: var(--muted); margin: 0; font-size: 14px; }
 .np-flags { position: relative; height: 30px; margin-right: 128px; }
-.np-flag { position: absolute; top: 0; transform: translateX(-50%); min-width: 26px; height: 26px; padding: 0 7px;
-  border-radius: 6px 6px 6px 0; background: var(--sheet); color: var(--heat); border: 1.5px solid var(--heat);
-  font: 700 14px/22px "Instrument Sans", sans-serif; font-stretch: 80%; cursor: pointer; }
+.np-flag { position: absolute; top: 0; transform: translateX(-50%); min-width: 26px; height: 26px; padding: 0 7px; border-radius: 6px 6px 6px 0;
+  background: var(--sheet); color: var(--heat); border: 1.5px solid var(--heat); font: 700 14px/22px "Instrument Sans", sans-serif; font-stretch: 80%; }
 .np-flag:hover, .np-flag.on { background: var(--heat); color: #fff; }
 .np-plotwrap { display: flex; }
-.np-plot { position: relative; flex: 1; height: 200px; border-bottom: 1px solid var(--ink); }
+.np-plot { position: relative; flex: 1; height: 190px; border-bottom: 1px solid var(--ink); }
 .np-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .np-plot .area { fill: #E3E6EB; }
 .np-plot .trace { fill: none; stroke: var(--ink); stroke-width: 1.25; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
@@ -789,42 +966,74 @@ footer { display: none !important; }
 .np-ticks { position: relative; height: 22px; margin-right: 128px; }
 .np-ticks span { position: absolute; top: 6px; font-size: 12.5px; color: var(--muted); transform: translateX(-50%); }
 .np-ticks span:first-child { transform: none; }
-.np-cap { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
+.np-plot .voice { fill: none; stroke: #3B6FD8; stroke-width: 1.25; vector-effect: non-scaling-stroke; stroke-linejoin: round; opacity: .85; }
+.np-plot .voice.main { stroke: var(--ink); opacity: 1; }
+.np-plot .voice-area { fill: #E3E6EB; }
+.np-said { position: absolute; left: 0; right: 0; bottom: -7px; height: 6px; }
+.np-said i { position: absolute; width: 2px; height: 6px; background: #6A3FB5; transform: translateX(-1px); }
+.np-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+.np-legend i { display: inline-block; width: 14px; height: 3px; margin-right: 6px; vertical-align: 3px; border-radius: 2px; }
+.np-legend .k-chat { background: var(--ink); }
+.np-legend .k-voice { background: #3B6FD8; }
+.np-legend .k-said { background: #6A3FB5; width: 3px; height: 10px; vertical-align: -1px; }
+.np-legend .k-clip { background: var(--heat); opacity: .5; height: 10px; vertical-align: -1px; }
+.np-legend .when { margin-left: auto; }
 
-/* tabs */
-.tab-wrapper, [role="tablist"] { border-bottom: 1px solid var(--rule) !important; margin-top: 10px; }
+/* clip selector row */
+#np-cliprow { align-items: flex-end; gap: 12px; background: transparent !important; border: 0 !important; max-width: 760px; }
+#np-cliprow > .form, #np-cliprow .form { background: transparent !important; border: 0 !important; box-shadow: none !important; }
+#np-clipsel { max-width: 560px; border: 1px solid var(--rule) !important; border-radius: var(--r-lg) !important; }
+#np-delclip { align-self: center; }
+
+/* basis picker */
+#np-basis .wrap { display: flex; flex-direction: column; gap: 6px; }
+#np-basis label { width: 100%; }
+#np-basis .info, #np-basis [data-testid="block-info"] + span { font-size: 12.5px; }
+.np-by { font-size: 18px; font-stretch: 100%; font-weight: 600; }
+.by { display: inline-block; font-size: 12px; font-weight: 600; padding: 1px 7px; border-radius: 4px; margin-right: 4px; }
+.by-chat { background: var(--sunk); color: var(--ink); border: 1px solid var(--rule); }
+.by-audio { background: #E6EEFB; color: #2D5BB9; }
+.by-speech { background: #EFE8FB; color: #6A3FB5; }
+.chip.sc b { color: var(--heat); margin: 0 2px 0 0; }
+.chip.said { background: #EFE8FB; border-color: #DCCDF5; }
+
+/* ---------- tabs ---------- */
+.tab-wrapper, [role="tablist"] { border-bottom: 1px solid var(--rule) !important; }
 button[role="tab"] { font-size: 15px !important; font-weight: 600 !important; color: var(--muted) !important; padding: 10px 2px !important; margin-right: 22px !important; background: transparent !important; border: 0 !important; }
 button[role="tab"].selected, button[role="tab"][aria-selected="true"] { color: var(--ink) !important; }
 button[role="tab"].selected::after, button[role="tab"][aria-selected="true"]::after { background: var(--ink) !important; height: 2px !important; }
 .tabitem { padding: 16px 0 0 !important; border: 0 !important; background: transparent !important; }
 
 /* clip list */
-.np-list { display: flex; flex-direction: column; background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
-.np-list-empty { padding: 28px 20px; color: var(--muted); }
-.np-list-empty p { margin: 0; font-size: 15px; }
-.np-row { all: unset; box-sizing: border-box; display: grid; grid-template-columns: 34px 58px minmax(0,1fr) auto; gap: 14px; align-items: start;
-  padding: 16px 18px 16px 15px; border-left: 3px solid transparent; border-bottom: 1px solid var(--rule); cursor: pointer; }
+.np-list { display: flex; flex-direction: column; background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r-lg); overflow: hidden; }
+.np-list .np-bulk { padding-left: 6px; border-bottom: 1px solid var(--rule); background: var(--sunk); }
+.np-list-empty { padding: 26px 20px; }
+.np-list-empty p { margin: 0; font-size: 15px; color: var(--muted); }
+.np-row { display: flex; align-items: flex-start; padding-left: 6px; border-left: 3px solid transparent; border-bottom: 1px solid var(--rule); }
 .np-row:last-child { border-bottom: 0; }
 .np-row:hover { background: var(--sunk); }
 .np-row.on { background: var(--sunk); border-left-color: var(--heat); }
-.np-row:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
-.np-row .rank { font-size: 26px; line-height: 1; font-weight: 700; font-stretch: 75%; color: var(--ink); padding-top: 2px; }
-.np-row .score { display: flex; flex-direction: column; line-height: 1; }
-.np-row .score b { font-size: 26px; font-weight: 700; font-stretch: 75%; color: var(--heat); }
-.np-row .score small { font-size: 12px; color: var(--muted); margin-top: 4px; }
-.np-row .facts { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 14px; color: var(--muted); }
-.np-row .facts b { color: var(--ink); font-weight: 600; }
-.np-row .what { margin: 6px 0 0; font-size: 14.5px; line-height: 1.45; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.np-row .what.none { color: #8D94A0; }
+.np-row.picked { background: var(--heat-soft); }
+.np-row label.np-tick { margin-top: 10px; }
+.np-open { all: unset; box-sizing: border-box; flex: 1; min-width: 0; display: grid; grid-template-columns: 30px 54px minmax(0,1fr) auto; gap: 12px; align-items: start; padding: 16px 16px 16px 4px; }
+.np-open:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+.np-open .rank { font-size: 26px; line-height: 1; font-weight: 700; font-stretch: 75%; color: var(--ink); padding-top: 2px; }
+.np-open .score { display: flex; flex-direction: column; line-height: 1; }
+.np-open .score b { font-size: 26px; font-weight: 700; font-stretch: 75%; color: var(--heat); }
+.np-open .score small { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.np-open .facts { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 14px; color: var(--muted); }
+.np-open .facts b { color: var(--ink); font-weight: 600; }
+.np-open .what { margin: 6px 0 0; font-size: 14.5px; line-height: 1.45; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.np-open .what.none { color: var(--faint); }
 .pill { font-size: 12.5px; font-weight: 600; padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
 .pill.rendered { background: var(--ok-soft); color: var(--ok); }
 .pill.ready { background: var(--sunk); color: var(--ink); border: 1px solid var(--rule); }
 .pill.wait { background: var(--wait-soft); color: var(--wait); }
 
 /* clip card */
-.np-card { background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px; padding: 20px 22px 22px; }
-.np-card-empty { color: var(--muted); padding: 28px 22px; }
-.np-card-empty p { margin: 0; font-size: 15px; }
+.np-card { background: var(--sheet); border: 1px solid var(--rule); border-radius: var(--r-lg); padding: 20px 22px 22px; }
+.np-card-empty { padding: 26px 22px; }
+.np-card-empty p { margin: 0; font-size: 15px; color: var(--muted); }
 .np-card-top { display: flex; gap: 18px; align-items: center; padding-bottom: 16px; border-bottom: 1px solid var(--rule); }
 .np-score { display: flex; align-items: baseline; }
 .np-score b { font-size: 64px; line-height: .9; font-weight: 700; font-stretch: 75%; color: var(--heat); letter-spacing: -0.02em; }
@@ -839,46 +1048,43 @@ button[role="tab"].selected::after, button[role="tab"][aria-selected="true"]::af
 .np-card p { margin: 0; font-size: 15px; line-height: 1.55; max-width: 70ch; }
 .np-card em { color: var(--muted); font-style: normal; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip { font-size: 13px; padding: 3px 9px; border-radius: 6px; background: var(--sunk); border: 1px solid var(--rule); color: var(--ink); }
+.chip { font-size: 13px; padding: 3px 9px; border-radius: var(--r-sm); background: var(--sunk); border: 1px solid var(--rule); color: var(--ink); }
 .chip b { font-weight: 700; margin-left: 2px; }
+#np-delclip { align-self: flex-start; }
 
-/* section heads in the editor */
+/* section heads */
 .np-sec h3 { font-size: 16px; font-weight: 650; margin: 4px 0 2px; color: var(--ink); }
-.np-sec p { font-size: 13.5px; color: var(--muted); margin: 0; }
+.np-sec p { font-size: 13.5px; color: var(--muted); margin: 0; line-height: 1.45; }
 .np-sec { margin-top: 6px; }
 
-/* live */
-.np-live { display: inline-block; vertical-align: 4px; margin-right: 10px; font: 600 13px/1 "Instrument Sans", sans-serif;
-  font-stretch: 100%; letter-spacing: 0; color: #fff; background: var(--heat); padding: 5px 8px 5px 20px; border-radius: 5px; position: relative; }
-.np-live::before { content: ""; position: absolute; left: 8px; top: 50%; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%; background: #fff; }
-.np-live.off { background: var(--sunk); color: var(--muted); border: 1px solid var(--rule); }
-.np-live.off::before { background: var(--muted); }
-.np-livemsg { margin: 12px 0 0; font-size: 14px; color: var(--muted); }
-#np-stop { align-self: flex-end; margin-bottom: 14px; }
-
-/* library + danger buttons */
-.np-danger { background: var(--heat) !important; border-color: var(--heat) !important; color: #fff !important; }
-.np-danger:hover { background: #C93422 !important; }
-.np-danger-soft { color: #B5321F !important; }
-.np-checks label { width: 100%; }
-#np-sounds .wrap { display: flex; flex-direction: column; gap: 6px; max-height: 520px; overflow-y: auto; }
-#np-sounds label { width: 100%; }
-#np-msearch { min-height: 44px; align-self: flex-end; }
-
 /* colour row */
-#np-colours { align-items: center; gap: 6px; flex-wrap: wrap; }
-#np-colours { flex-wrap: nowrap !important; }
+#np-colours { align-items: center; gap: 6px; flex-wrap: nowrap !important; }
 #np-picker { flex: 0 0 auto !important; width: auto !important; padding: 0 !important; overflow: visible !important; background: transparent !important; }
 #np-picker .dialog-button { display: block; width: 40px !important; height: 32px !important; border: 1px solid #B9BFC9 !important; border-radius: 6px !important; }
-#np-minfo { padding: 2px 0 6px; }
 .np-sw { min-width: 0 !important; font-weight: 500 !important; padding-left: 8px !important; }
 .np-sw::before { content: ""; width: 14px; height: 14px; border-radius: 50%; display: inline-block; margin-right: 6px; border: 1px solid rgba(0,0,0,.25); vertical-align: -2px; }
 #sw-white::before { background: #FFFFFF; } #sw-yellow::before { background: #FFD400; } #sw-sky::before { background: #3FA0FF; }
 #sw-green::before { background: #39FF6A; } #sw-pink::before { background: #FF4FD8; }
 
+/* memes */
+#np-minfo { padding: 2px 0 6px; }
+#np-sounds .wrap { display: flex; flex-direction: column; gap: 6px; max-height: 520px; overflow-y: auto; }
+#np-sounds label { width: 100%; }
+#np-msearch { min-height: 44px; align-self: flex-end; }
+
 /* media */
 .np-media img, .np-media video { border-radius: 6px; }
 #np-pv img { background: #000; }
+
+/* confirm dialog */
+#np-modal { position: fixed !important; z-index: 1000; left: 50%; top: 28vh; transform: translateX(-50%); width: min(460px, calc(100vw - 32px));
+  background: var(--sheet) !important; border: 1px solid var(--rule) !important; border-radius: var(--r-lg) !important; padding: 20px 20px 16px !important;
+  box-shadow: 0 0 0 100vmax rgba(24,27,33,.45), 0 12px 40px rgba(24,27,33,.25) !important; }
+#np-modal #np-modal { position: static !important; transform: none !important; width: auto !important; padding: 0 !important;
+  box-shadow: none !important; border: 0 !important; }
+#np-modal h3 { margin: 0 0 6px; font-size: 19px; font-weight: 700; color: var(--ink); }
+#np-modal p { margin: 0 0 14px; font-size: 14.5px; line-height: 1.5; color: var(--muted); }
+#np-modal .row, #np-modal > div { background: transparent !important; border: 0 !important; gap: 10px; }
 """
 
 
@@ -887,194 +1093,224 @@ def section(title, note=""):
                    js_on_load=None)
 
 
-CLICK_JS = ("element.addEventListener('click', (e) => { const b = e.target.closest('[data-clip]'); "
-            "if (b) trigger('click', {clip: Number(b.dataset.clip)}); });")
+# One script for the sidebar, the clip list and the chart: open on click, tick to select, delete the selection.
+PICK_JS = """
+const upd = () => {
+  const n = element.querySelectorAll('.np-pick:checked').length;
+  const c = element.querySelector('.np-count'), d = element.querySelector('.np-bulk-del');
+  if (c) { if (!c.dataset.idle) c.dataset.idle = c.textContent; c.textContent = n ? n + ' selected' : c.dataset.idle; }
+  if (d) d.disabled = !n;
+  element.querySelectorAll('.np-row, .sb-row').forEach(r => { const x = r.querySelector('.np-pick'); r.classList.toggle('picked', !!(x && x.checked)); });
+};
+// a fresh list never keeps old ticks (rows shift after a delete)
+const clear = () => { element.querySelectorAll('.np-pick, .np-all').forEach(x => { x.checked = false; }); upd(); };
+if (typeof watch === 'function') watch('value', clear);
+element.addEventListener('change', (e) => {
+  if (e.target.classList.contains('np-all')) element.querySelectorAll('.np-pick').forEach(x => { x.checked = e.target.checked; });
+  upd();
+});
+element.addEventListener('click', (e) => {
+  if (e.target.closest('.np-tick')) return;
+  if (e.target.closest('.np-bulk-del')) {
+    const ids = [...element.querySelectorAll('.np-pick:checked')].map(x => x.dataset.id);
+    if (ids.length) trigger('click', {action: 'delete', ids: ids});
+    return;
+  }
+  const o = e.target.closest('[data-clip],[data-key]');
+  if (o) trigger('click', {action: 'open', id: o.dataset.clip !== undefined ? o.dataset.clip : o.dataset.key});
+});
+"""
 
 
 def build():
     jobs0 = job_choices()
+    first = jobs0[0][1] if jobs0 else ""
     with gr.Blocks(title="Clipper") as demo:
-        with gr.Row(elem_id="np-mast", equal_height=False):
-            with gr.Column(scale=4, min_width=280):
-                gr.HTML('<div id="np-brand"><h1>Clipper</h1><p>Finds where chat went off in a stream, past or '
-                        'live, and cuts those moments into vertical Shorts.</p></div>', js_on_load=None)
-            with gr.Column(scale=7, min_width=360):
-                with gr.Row(elem_id="np-find", equal_height=True):
-                    url = gr.Textbox(label="Past stream link", show_label=False, container=False, elem_id="np-url",
-                                     scale=5, lines=1, max_lines=1,
-                                     placeholder="Paste a stream link: a past VOD or a channel that's live now")
-                    go = gr.Button("Find clips", variant="primary", scale=1, min_width=130)
+        job = gr.Textbox(value=first, show_label=False, container=False, elem_classes="np-hide")
+        pend_kind, pend_ids = gr.State(""), gr.State([])
+        with gr.Group(visible=False, elem_id="np-modal") as modal:
+            modal_msg = gr.HTML(js_on_load=None)
+            with gr.Row():
+                m_cancel = gr.Button("Cancel")
+                m_yes = gr.Button("Delete", elem_classes="np-danger")
+
+        with gr.Row(elem_id="np-shell", equal_height=False):
+            # ---------- sidebar: find + library ----------
+            with gr.Column(scale=0, min_width=330, elem_id="np-side"):
+                gr.HTML('<div id="np-brand"><h1>Clipper</h1><p>Finds where chat went off in a stream, past or live, '
+                        'and cuts those moments into vertical Shorts.</p></div>', js_on_load=None)
+                url = gr.Textbox(label="Stream link", show_label=False, container=False, elem_id="np-url", lines=1,
+                                 max_lines=1, placeholder="Paste a past VOD or a live channel")
+                by_opts = [("Chat spikes", "chat"), ("Streamer gets loud", "audio"),
+                           ("What's said (subtitles)" + ("" if stt.available() else ", needs speech-to-text"), "speech")]
+                basis = gr.CheckboxGroup(by_opts, value=["chat"], label="Find clips by", elem_id="np-basis",
+                                         info="Tick one or more. Moments where several agree rank higher.")
+                keywords = gr.Textbox(label="Words to listen for (optional)", visible=False, elem_id="np-words",
+                                      placeholder="no way, let's go, clip that", lines=1, max_lines=2)
+                go = gr.Button("Find clips", variant="primary", elem_id="np-go")
                 with gr.Accordion("More options", open=False, elem_id="np-opts"):
-                    with gr.Row():
-                        top_n = gr.Slider(1, 30, value=10, step=1, label="How many clips to keep")
-                        cookies = gr.Dropdown([("None", ""), ("Chrome", "chrome"), ("Safari", "safari"),
-                                               ("Firefox", "firefox"), ("Brave", "brave"), ("Edge", "edge")], value="",
-                                              label="Sign in with browser cookies (members-only or age-gated)")
-                    with gr.Row():
-                        hours = gr.Slider(0.5, 12, value=6, step=0.5, label="Live streams: stop watching after (hours)")
-                        chat_file = gr.File(label="Chat file (exported Twitch or Kick chat, JSON or CSV)",
-                                            file_types=[".json", ".csv"], height=110)
+                    top_n = gr.Slider(1, 30, value=10, step=1, label="How many clips to keep (past streams)")
+                    hours = gr.Slider(0.5, 12, value=6, step=0.5, label="Live streams: stop watching after (hours)")
+                    cookies = gr.Dropdown([("None", ""), ("Chrome", "chrome"), ("Safari", "safari"),
+                                           ("Firefox", "firefox"), ("Brave", "brave"), ("Edge", "edge")], value="",
+                                          label="Sign in with browser cookies (members-only or age-gated)")
+                    chat_file = gr.File(label="Chat file (exported Twitch or Kick chat, JSON or CSV)",
+                                        file_types=[".json", ".csv"], height=100)
+                side = gr.HTML(sidebar_html(first), js_on_load=PICK_JS)
 
-        with gr.Group(elem_id="np-streambox"):
-            with gr.Row(elem_id="np-bar"):
-                job = gr.Dropdown(choices=jobs0, value=jobs0[0][1] if jobs0 else None, label="Stream",
-                                  interactive=True, scale=3)
-                clip = gr.Dropdown(choices=[], label="Open clip", interactive=True, scale=2)
-                stop_btn = gr.Button("Stop watching", visible=False, scale=0, min_width=150, elem_id="np-stop")
-        with gr.Column(elem_id="np-chartbox", variant="panel"):
-            status = gr.HTML(status_html(None), js_on_load=None)
-            chart = gr.HTML(chart_html(None), js_on_load=CLICK_JS)
+            # ---------- main ----------
+            with gr.Column(scale=1, min_width=560, elem_id="np-main"):
+                with gr.Row(elem_id="np-head", equal_height=False):
+                    status = gr.HTML(status_html(None), js_on_load=None, scale=1)
+                    with gr.Column(scale=0, min_width=170, elem_id="np-actions"):
+                        stop_btn = gr.Button("Stop watching", visible=False, elem_classes="np-danger")
+                        del_stream = gr.Button("Delete stream", visible=False, size="sm", elem_classes="np-danger-soft")
+                with gr.Column(elem_id="np-chartbox", variant="panel"):
+                    chart = gr.HTML(chart_html(None), js_on_load=PICK_JS)
+                with gr.Row(elem_id="np-cliprow", equal_height=True):
+                    clip = gr.Dropdown(choices=[], label="Open clip", interactive=True, elem_id="np-clipsel", scale=1)
+                    del_clip = gr.Button("Delete this clip", size="sm", visible=False, scale=0, min_width=150,
+                                         elem_classes="np-danger-soft", elem_id="np-delclip")
 
-        with gr.Tabs():
-            with gr.Tab("Clips"):
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=6, min_width=420):
-                        clip_list = gr.HTML(list_html(None), js_on_load=CLICK_JS)
-                    with gr.Column(scale=5, min_width=380):
-                        card = gr.HTML(card_html(None, None), js_on_load=None)
-                        src_vid = gr.Video(label="Clip as downloaded", show_label=False, interactive=False,
-                                           elem_classes="np-media", visible=False)
+                with gr.Tabs():
+                    with gr.Tab("Clips"):
+                        with gr.Row(equal_height=False):
+                            with gr.Column(scale=6, min_width=420):
+                                clip_list = gr.HTML(list_html(None), js_on_load=PICK_JS)
+                            with gr.Column(scale=5, min_width=360):
+                                card = gr.HTML(card_html(None, None), js_on_load=None)
+                                src_vid = gr.Video(label="Clip as downloaded", show_label=False, interactive=False,
+                                                   elem_classes="np-media", visible=False)
 
-            with gr.Tab("Make the Short"):
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=3, min_width=420):
-                        section("Crops", "Pick a moment, then frame the face cam (blue) and the gameplay (orange).")
-                        t = gr.Slider(0, 60, value=1, step=0.1, label="Frame to set the crops on (seconds)")
-                        crop_view = gr.Image(show_label=False, interactive=False, elem_classes="np-media",
-                                             buttons=[])
-                        with gr.Row():
-                            with gr.Column(min_width=200):
-                                section("Face cam")
+                    with gr.Tab("Make the Short"):
+                        with gr.Row(equal_height=False):
+                            with gr.Column(scale=3, min_width=380):
+                                section("Crops", "Pick a moment, then frame the face cam (blue) and the gameplay (orange).")
+                                t = gr.Slider(0, 60, value=1, step=0.1, label="Frame to set the crops on (seconds)")
+                                crop_view = gr.Image(show_label=False, interactive=False, elem_classes="np-media", buttons=[])
+                                with gr.Row():
+                                    with gr.Column(min_width=180):
+                                        section("Face cam")
+                                        with gr.Group():
+                                            fx = gr.Slider(0, 1, step=0.005, label="Left edge")
+                                            fy = gr.Slider(0, 1, step=0.005, label="Top edge")
+                                            fw = gr.Slider(0.03, 1, step=0.005, label="Width (height follows the band)")
+                                    with gr.Column(min_width=180):
+                                        section("Gameplay")
+                                        with gr.Group():
+                                            gx = gr.Slider(0, 1, step=0.005, label="Left edge")
+                                            gy = gr.Slider(0, 1, step=0.005, label="Top edge")
+                                            gw = gr.Slider(0.05, 1, step=0.005, label="Width (height follows the band)")
+                            with gr.Column(scale=2, min_width=340):
+                                section("Preview", "The Short at this frame, 9:16.")
+                                pv = gr.Image(show_label=False, interactive=False, height=PV_H, elem_id="np-pv",
+                                              elem_classes="np-media", buttons=[])
+                                section("Layout")
+                                layout = gr.Radio([("Face on top", "faceTop"), ("Face at bottom", "faceBottom"),
+                                                   ("No face", "noFace")], show_label=False, value="faceTop")
+                                split = gr.Slider(0.25, 0.55, step=0.01, value=0.4, label="Face band height (share of the frame)")
+                                section("Opening")
                                 with gr.Group():
-                                    fx = gr.Slider(0, 1, step=0.005, label="Left edge")
-                                    fy = gr.Slider(0, 1, step=0.005, label="Top edge")
-                                    fw = gr.Slider(0.03, 1, step=0.005, label="Width (height follows the band)")
-                            with gr.Column(min_width=200):
-                                section("Gameplay")
+                                    hook_on = gr.Checkbox(label="Open with the hot moment, then play the full clip", value=True)
+                                    with gr.Row():
+                                        hs = gr.Number(label="Hook starts (s)", step=0.1)
+                                        he = gr.Number(label="Hook ends (s)", step=0.1)
+                                    with gr.Row():
+                                        ts = gr.Number(label="Clip starts (s)", step=0.1)
+                                        te = gr.Number(label="Clip ends (s)", step=0.1)
+                                section("Subtitles", "One word at a time, no box, black shadow.")
                                 with gr.Group():
-                                    gx = gr.Slider(0, 1, step=0.005, label="Left edge")
-                                    gy = gr.Slider(0, 1, step=0.005, label="Top edge")
-                                    gw = gr.Slider(0.05, 1, step=0.005, label="Width (height follows the band)")
-                    with gr.Column(scale=2, min_width=360):
-                        section("Preview", "The Short at this frame, 9:16.")
-                        pv = gr.Image(show_label=False, interactive=False, height=PV_H, elem_id="np-pv",
-                                      elem_classes="np-media", buttons=[])
-                        section("Layout")
-                        layout = gr.Radio([("Face on top", "faceTop"), ("Face at bottom", "faceBottom"), ("No face", "noFace")],
-                                          show_label=False, value="faceTop")
-                        split = gr.Slider(0.25, 0.55, step=0.01, value=0.4, label="Face band height (share of the frame)")
-                        section("Opening")
-                        with gr.Group():
-                            hook_on = gr.Checkbox(label="Open with the hot moment, then play the full clip", value=True)
-                            with gr.Row():
-                                hs = gr.Number(label="Hook starts (s)", step=0.1)
-                                he = gr.Number(label="Hook ends (s)", step=0.1)
-                            with gr.Row():
-                                ts = gr.Number(label="Clip starts (s)", step=0.1)
-                                te = gr.Number(label="Clip ends (s)", step=0.1)
-                        section("Subtitles", "One word at a time, no box, black shadow.")
-                        with gr.Group():
-                            with gr.Row():
-                                subs_on = gr.Checkbox(label="Show subtitles", value=True)
-                                upper = gr.Checkbox(label="Uppercase", value=True)
-                        swatches = []
-                        with gr.Row(elem_id="np-colours", equal_height=True):
-                            color = gr.ColorPicker(label="Colour", show_label=False, container=False, value="#FFFFFF",
-                                                   scale=0, min_width=48, elem_id="np-picker")
-                            for name, hx in (("White", "#FFFFFF"), ("Yellow", "#FFD400"), ("Sky", "#3FA0FF"),
-                                             ("Green", "#39FF6A"), ("Pink", "#FF4FD8")):
-                                swatches.append((gr.Button(name, size="sm", min_width=40, elem_id=f"sw-{name.lower()}",
-                                                           elem_classes="np-sw"), hx))
-                        with gr.Group():
-                            size = gr.Slider(50, 200, step=2, value=110, label="Size (px)")
-                            sy = gr.Slider(0.08, 0.92, step=0.01, value=0.4, label="Height on screen (0 is the top)")
-                        seam = gr.Button("Put words on the seam between face and gameplay", size="sm")
-                        section("Export")
-                        with gr.Row():
-                            render_btn = gr.Button("Render Short", variant="primary", scale=2)
-                            studio_btn = gr.Button("Open in Remotion Studio", scale=2)
-                        render_msg = gr.HTML(js_on_load=None)
-                        final_vid = gr.Video(label="Finished Short", show_label=False, interactive=False,
-                                             elem_classes="np-media", visible=False)
-                        files = gr.File(label="Downloads (MP4 and SRT)", file_count="multiple", interactive=False,
-                                        visible=False)
+                                    with gr.Row():
+                                        subs_on = gr.Checkbox(label="Show subtitles", value=True)
+                                        upper = gr.Checkbox(label="Uppercase", value=True)
+                                swatches = []
+                                with gr.Row(elem_id="np-colours", equal_height=True):
+                                    color = gr.ColorPicker(label="Colour", show_label=False, container=False,
+                                                           value="#FFFFFF", scale=0, min_width=48, elem_id="np-picker")
+                                    for name, hx in (("White", "#FFFFFF"), ("Yellow", "#FFD400"), ("Sky", "#3FA0FF"),
+                                                     ("Green", "#39FF6A"), ("Pink", "#FF4FD8")):
+                                        swatches.append((gr.Button(name, size="sm", min_width=40, elem_id=f"sw-{name.lower()}",
+                                                                   elem_classes="np-sw"), hx))
+                                with gr.Group():
+                                    size = gr.Slider(50, 200, step=2, value=110, label="Size (px)")
+                                    sy = gr.Slider(0.08, 0.92, step=0.01, value=0.4, label="Height on screen (0 is the top)")
+                                seam = gr.Button("Put words on the seam between face and gameplay", size="sm")
+                                section("Export")
+                                with gr.Row():
+                                    render_btn = gr.Button("Render Short", variant="primary", scale=2)
+                                    studio_btn = gr.Button("Open in Remotion Studio", scale=2)
+                                render_msg = gr.HTML(js_on_load=None)
+                                final_vid = gr.Video(label="Finished Short", show_label=False, interactive=False,
+                                                     elem_classes="np-media", visible=False)
+                                files = gr.File(label="Downloads (MP4 and SRT)", file_count="multiple", interactive=False,
+                                                visible=False)
 
-            with gr.Tab("Memes"):
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=3, min_width=420):
-                        section("Find a meme", "Video memes with sound are short clips (40 s or less) found on YouTube. "
-                                "Meme sounds come from myinstants.com. Classic images come from memegen.link and Imgflip.")
-                        m_src = gr.Radio([("Video memes with sound", "videos"), ("Meme sounds", "sounds"),
-                                          ("Classic images", "classic")], value="videos", label="Source")
-                        with gr.Row(equal_height=True):
-                            m_q = gr.Textbox(label="Search (leave empty for popular ones)", scale=4,
-                                             placeholder="bruh, emotional damage, vine boom")
-                            m_search = gr.Button("Search memes", variant="primary", scale=1, min_width=150,
-                                                 elem_id="np-msearch")
-                        m_rows = gr.State([])
-                        m_item = gr.State(None)
-                        m_results = gr.Gallery(label="Results", show_label=False, columns=4, height=520,
-                                               object_fit="cover", allow_preview=False)
-                        m_sounds = gr.Radio([], label="Sounds: click one to hear it", visible=False,
-                                            elem_id="np-sounds")
-                    with gr.Column(scale=2, min_width=360):
-                        section("Picked meme")
-                        m_info = gr.Markdown("Click a result to pick it.", elem_id="np-minfo")
-                        with gr.Group(visible=False) as m_text:
-                            m_top = gr.Textbox(label="Top text (optional)")
-                            m_bottom = gr.Textbox(label="Bottom text (optional)")
-                        m_pv = gr.Image(label="Preview", show_label=False, interactive=False, height=320, buttons=[],
-                                        elem_classes="np-media", visible=False)
-                        m_pv_vid = gr.Video(label="Preview", show_label=False, interactive=False, height=320,
-                                            elem_classes="np-media", visible=False)
-                        m_pv_aud = gr.Audio(label="Preview", show_label=False, interactive=False, visible=False)
-                        m_save = gr.Button("Save to this clip", variant="primary")
-                        m_msg = gr.Markdown()
-                        section("Saved for this clip", "Newest first. Sounds are in the downloads below.")
-                        m_gallery = gr.Gallery(show_label=False, columns=3, height=240, object_fit="contain")
-                        m_files = gr.File(label="Downloads", file_count="multiple", interactive=False, visible=False)
-
-            with gr.Tab("Library") as lib_tab:
-                with gr.Row(equal_height=False):
-                    with gr.Column(min_width=420):
-                        section("Streams", "Tick the streams to delete. Each goes with all its clips and memes.")
-                        lib_streams = gr.CheckboxGroup([], show_label=False, elem_classes="np-checks")
-                        with gr.Row():
-                            lib_all_s = gr.Button("Select all", size="sm")
-                            lib_del_s = gr.Button("Delete selected streams", size="sm", elem_classes="np-danger-soft")
-                        with gr.Group(visible=False) as lib_conf_s:
-                            lib_conf_s_msg = gr.HTML(js_on_load=None)
-                            with gr.Row():
-                                lib_yes_s = gr.Button("Delete", elem_classes="np-danger")
-                                lib_no_s = gr.Button("Cancel")
-                    with gr.Column(min_width=420):
-                        section("Clips in the open stream", "Tick the clips to delete. The stream itself stays.")
-                        lib_clips = gr.CheckboxGroup([], show_label=False, elem_classes="np-checks")
-                        with gr.Row():
-                            lib_all_c = gr.Button("Select all", size="sm")
-                            lib_del_c = gr.Button("Delete selected clips", size="sm", elem_classes="np-danger-soft")
-                        with gr.Group(visible=False) as lib_conf_c:
-                            lib_conf_c_msg = gr.HTML(js_on_load=None)
-                            with gr.Row():
-                                lib_yes_c = gr.Button("Delete", elem_classes="np-danger")
-                                lib_no_c = gr.Button("Cancel")
-                lib_msg = gr.HTML(js_on_load=None)
+                    with gr.Tab("Memes"):
+                        with gr.Row(equal_height=False):
+                            with gr.Column(scale=3, min_width=380):
+                                section("Find a meme", "Video memes with sound are short clips (40 s or less) found on "
+                                        "YouTube. Meme sounds come from myinstants.com. Classic images come from "
+                                        "memegen.link and Imgflip.")
+                                m_src = gr.Radio([("Video memes with sound", "videos"), ("Meme sounds", "sounds"),
+                                                  ("Classic images", "classic")], value="videos", label="Source")
+                                with gr.Row(equal_height=True):
+                                    m_q = gr.Textbox(label="Search (leave empty for popular ones)", scale=4,
+                                                     placeholder="bruh, emotional damage, vine boom")
+                                    m_search = gr.Button("Search memes", variant="primary", scale=1, min_width=150,
+                                                         elem_id="np-msearch")
+                                m_rows = gr.State([])
+                                m_item = gr.State(None)
+                                m_results = gr.Gallery(label="Results", show_label=False, columns=4, height=520,
+                                                       object_fit="cover", allow_preview=False)
+                                m_sounds = gr.Radio([], label="Sounds: click one to hear it", visible=False,
+                                                    elem_id="np-sounds")
+                            with gr.Column(scale=2, min_width=340):
+                                section("Picked meme")
+                                m_info = gr.Markdown("Click a result to pick it.", elem_id="np-minfo")
+                                with gr.Group(visible=False) as m_text:
+                                    m_top = gr.Textbox(label="Top text (optional)")
+                                    m_bottom = gr.Textbox(label="Bottom text (optional)")
+                                m_pv = gr.Image(label="Preview", show_label=False, interactive=False, height=320,
+                                                buttons=[], elem_classes="np-media", visible=False)
+                                m_pv_vid = gr.Video(label="Preview", show_label=False, interactive=False, height=320,
+                                                    elem_classes="np-media", visible=False)
+                                m_pv_aud = gr.Audio(label="Preview", show_label=False, interactive=False, visible=False)
+                                m_save = gr.Button("Save to this clip", variant="primary")
+                                m_msg = gr.Markdown()
+                                section("Saved for this clip", "Newest first. Sounds are in the downloads below.")
+                                m_gallery = gr.Gallery(show_label=False, columns=3, height=240, object_fit="contain")
+                                m_files = gr.File(label="Downloads", file_count="multiple", interactive=False,
+                                                  visible=False)
 
         timer = gr.Timer(2.0)
         edit_inputs = [job, clip, t, layout, split, fx, fy, fw, gx, gy, gw, hook_on, hs, he, ts, te, subs_on, color, size, sy, upper]
         editor_fields = [t, layout, split, fx, fy, fw, gx, gy, gw, hook_on, hs, he, ts, te, subs_on, color, size, sy, upper]
         quiet = dict(show_progress="hidden")
+        head_out = [status, chart, clip_list, clip, stop_btn, del_stream, side]
+        ask_out = [pend_kind, pend_ids, modal, modal_msg]
 
-        bar_out = [status, chart, clip_list, clip, stop_btn]
-        go.click(start_analysis, [url, top_n, cookies, chat_file, hours], job)
-        job.input(switch_job, job, bar_out, **quiet)
-        job.change(lambda k, n: refresh_job(k, n), [job, clip], bar_out, **quiet)
-        demo.load(first_load, job, bar_out, **quiet)
-        timer.tick(tick, [job, clip], bar_out, **quiet)
+        # streams
+        basis.change(lambda b: gr.update(visible="speech" in (b or [])), basis, keywords, **quiet)
+        go.click(start_analysis, [url, top_n, cookies, chat_file, hours, basis, keywords], job).then(
+            lambda k: refresh_job(k), job, head_out, **quiet)
+        job.change(switch_job, job, head_out, **quiet)
+        demo.load(first_load, job, head_out, **quiet)
+        timer.tick(tick, [job, clip], head_out, **quiet)
         stop_btn.click(stop_live, job, stop_btn, **quiet)
-        clip_list.click(pick_clip, None, clip, **quiet)
-        chart.click(pick_clip, None, clip, **quiet)
+        side.click(side_click, None, [job] + ask_out, **quiet)
+
+        # deleting (one confirm dialog for everything)
+        del_stream.click(ask_stream, job, ask_out, **quiet)
+        del_clip.click(ask_clip, [job, clip], ask_out, **quiet)
+        m_cancel.click(lambda: gr.update(visible=False), None, modal, **quiet)
+        m_yes.click(do_delete, [pend_kind, pend_ids, job, clip],
+                    [modal, job, clip, status, chart, clip_list, side, del_stream], **quiet)
+
+        # clips
+        clip_list.click(list_click, job, [clip] + ask_out, **quiet)
+        chart.click(list_click, job, [clip] + ask_out, **quiet)
         clip.change(highlight, [job, clip], [chart, clip_list], **quiet)
+        clip.change(lambda n: gr.update(visible=n is not None), clip, del_clip, **quiet)
         clip.change(load_clip, [job, clip], [card, src_vid] + editor_fields + [final_vid, files], **quiet).then(
             apply_edit, edit_inputs, [crop_view, pv], **quiet)
         for comp in editor_fields:      # user edits only (not the values load_clip fills in)
@@ -1087,6 +1323,7 @@ def build():
             do_render, [job, clip], [render_msg, final_vid, files], **quiet)
         studio_btn.click(apply_edit, edit_inputs, [crop_view, pv], **quiet).then(open_studio, [job, clip], render_msg, **quiet)
 
+        # memes
         clip.change(meme_load, [job, clip], [m_q, m_gallery, m_files], **quiet)
         pv_out = [m_pv, m_pv_vid, m_pv_aud]
         for ev in (m_search.click, m_q.submit, m_src.change):
@@ -1099,18 +1336,6 @@ def build():
             box.submit(meme_preview, [m_item, m_top, m_bottom], pv_out)
             box.blur(meme_preview, [m_item, m_top, m_bottom], pv_out)
         m_save.click(meme_save, [job, clip, m_item, m_top, m_bottom], [m_msg, m_gallery, m_files])
-
-        lib_out = [lib_streams, lib_clips, lib_conf_s, lib_conf_c]
-        lib_tab.select(lib_refresh, job, lib_out, **quiet)
-        job.change(lib_refresh, job, lib_out, **quiet)
-        lib_all_s.click(lambda: gr.update(value=[k for _, k in lib_stream_choices()]), None, lib_streams, **quiet)
-        lib_all_c.click(lambda k: gr.update(value=[i for _, i in lib_clip_choices(k)]), job, lib_clips, **quiet)
-        lib_del_s.click(ask_streams, lib_streams, [lib_conf_s_msg, lib_conf_s], **quiet)
-        lib_del_c.click(ask_clips, [job, lib_clips], [lib_conf_c_msg, lib_conf_c], **quiet)
-        lib_no_s.click(lambda: gr.update(visible=False), None, lib_conf_s, **quiet)
-        lib_no_c.click(lambda: gr.update(visible=False), None, lib_conf_c, **quiet)
-        lib_yes_s.click(do_delete_streams, [lib_streams, job], [job, clip, lib_msg] + lib_out, **quiet)
-        lib_yes_c.click(do_delete_clips, [job, lib_clips, clip], [clip, clip_list, chart, lib_msg] + lib_out, **quiet)
     return demo
 
 

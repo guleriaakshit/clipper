@@ -2,17 +2,20 @@
 import traceback
 from pathlib import Path
 
-from . import chat, spikes, download, hotspot, subs, face, render
+from . import chat, download, face, hotspot, render, signals, spikes, stt, subs
 from .common import job_dir, read_json, set_status, write_json, fmt_t
 from .platforms import detect
 
 
-def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=False):
+def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=False, basis=("chat",), keywords=""):
+    """basis: any of "chat", "audio", "speech" (see signals.py)."""
     platform, vid = detect(url)
     jd = job_dir(platform, vid)
-    write_json(jd / "job.json", {"url": url, "platform": platform, "id": vid, "cookies_browser": cookies_browser})
+    basis = [b for b in ("chat", "audio", "speech") if b in (basis or ())] or ["chat"]
+    write_json(jd / "job.json", {"url": url, "platform": platform, "id": vid, "cookies_browser": cookies_browser,
+                                 "basis": basis, "keywords": keywords})
     try:
-        _run(url, platform, vid, jd, top_n, cookies_browser, chat_file, skip_download)
+        _run(url, platform, vid, jd, top_n, cookies_browser, chat_file, skip_download, basis, keywords)
     except Exception as e:
         set_status(jd, "error", 0, "", f"{e}")
         (jd / "error.log").write_text(traceback.format_exc())
@@ -20,18 +23,44 @@ def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=F
     return jd
 
 
-def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_download):
+def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_download, basis, keywords):
     prog = lambda pct, msg: set_status(jd, "chat", pct, msg)
+    msgs = []
     if (jd / "chat.json").exists() and not chat_file:
         msgs, meta = read_json(jd / "chat.json"), read_json(jd / "meta.json")
         prog(30, "Chat already fetched")
-    else:
+    elif "chat" in basis or chat_file:
         msgs, meta = chat.fetch(platform, url, vid, jd, prog, cookies_browser=cookies_browser, chat_file=chat_file)
         write_json(jd / "chat.json", msgs)
         write_json(jd / "meta.json", meta)
+    else:
+        prog(2, "Reading video info")
+        meta = chat.MODS[platform].meta_of(url, cookies_browser)
+        write_json(jd / "meta.json", meta)
+    if not meta.get("duration"):
+        raise RuntimeError("Couldn't tell how long this stream is.")
 
-    set_status(jd, "spikes", 32, f"{len(msgs)} chat messages. Finding spikes")
-    res = spikes.analyse(msgs, meta["duration"], top_n=top_n)
+    db, words = None, None
+    if "audio" in basis or "speech" in basis:
+        speech = "speech" in basis
+        if speech and not stt.available():
+            raise RuntimeError("Finding clips by what's said needs the speech-to-text model. Run `clipper stt-download`.")
+        old = read_json(jd / "signals.json", {}) or {}
+        if old.get("db") and (not speech or (jd / "transcript.json").exists()):
+            db, words = old["db"], read_json(jd / "transcript.json") if speech else None
+        else:
+            scan = signals.scan_url(url, meta["duration"], speech=speech, cookies_browser=cookies_browser,
+                                    progress=lambda pct, msg: set_status(jd, "listen", pct, msg))
+            db, words = scan.db, (scan.words if speech else None)
+            write_json(jd / "signals.json", {"bin": signals.BIN, "db": db})
+            if speech:
+                write_json(jd / "transcript.json", words)
+
+    names = ", ".join(signals.NAMES[b].lower() for b in basis)
+    set_status(jd, "spikes", 32, f"Finding moments by {names}")
+    if "chat" in basis and not msgs:
+        raise RuntimeError("No chat to find spikes in. Untick chat spikes or add a chat file.")
+    res = signals.find(basis, meta["duration"], msgs=msgs, db=db, words=words, keywords=keywords, top_n=top_n)
     old = {c["id"]: c for c in (read_json(jd / "clips.json", {}) or {}).get("clips", [])}
     for c in res["clips"]:
         c["vod_time"] = fmt_t(c["start"])
@@ -41,12 +70,15 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
         else:
             c["what"], c["why"] = "", ""
     summary = {"url": url, "platform": platform, "id": vid, "title": meta.get("title"), "channel": meta.get("channel"),
-               "duration": meta["duration"], "messages": len(msgs), "avg_per_min": res["avg_per_min"],
-               "bin": res["bin"], "clips": res["clips"]}
-    write_json(jd / "rates.json", {"bin": res["bin"], "avg": res["avg"], "counts": res["counts"]})
+               "duration": meta["duration"], "messages": len(msgs), "avg_per_min": res.get("avg_per_min", 0),
+               "bin": res["bin"], "basis": basis, "keywords": keywords, "clips": res["clips"]}
+    if msgs:
+        write_json(jd / "rates.json", {"bin": res["bin"], "avg": res["avg"], "counts": res["counts"]})
+    else:
+        (jd / "rates.json").unlink(missing_ok=True)
     write_json(jd / "clips.json", summary)
     if not res["clips"]:
-        set_status(jd, "done", 100, "No chat spikes of 2x the average or more in this stream.")
+        set_status(jd, "done", 100, f"No moments found by {names} in this stream.")
         return
     if skip_download:
         set_status(jd, "done", 100, "Spikes found (download skipped)")
@@ -71,7 +103,7 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
 def prepare_clip(cd: Path, c, src, info, progress=lambda frac, msg: None):
     """After the clip's source.mp4 exists: hot moment, word timings, face crop, clip.json, edit.json."""
     progress(0.5, "finding the hot moment")
-    hook = hotspot.find(src, c["start"], c["chat_peak"], info["duration"])
+    hook = hotspot.find(src, c["start"], c.get("hot_ref", c["chat_peak"]), info["duration"])
     progress(0.6, "transcribing for subtitles")
     try:
         subs.words(src, cd / "words.json")

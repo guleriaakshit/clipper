@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import spikes
+from . import signals, spikes
 from .common import JOBS, fmt_t, read_json, set_status, video_info, write_json
 
 BUFFER_S = 600          # seconds of video kept on disk
@@ -76,12 +76,13 @@ def probe(url):
     return None
 
 
-def new_job(target, hours=6.0, top_n=30):
+def new_job(target, hours=6.0, top_n=30, basis=("chat",), keywords=""):
     key = f"{target['platform']}-live-{re.sub(r'[^A-Za-z0-9_-]', '', target['id'])}-{time.strftime('%Y%m%d-%H%M%S')}"
     jd = JOBS / key
     jd.mkdir(parents=True)
+    basis = [b for b in ("chat", "audio", "speech") if b in (basis or ())] or ["chat"]
     write_json(jd / "job.json", {"url": target["url"], "platform": target["platform"], "id": target["id"], "live": True,
-                                 "hours": hours, "top_n": top_n})
+                                 "hours": hours, "top_n": top_n, "basis": basis, "keywords": keywords})
     write_json(jd / "meta.json", {"title": target.get("title"), "channel": target.get("channel"), "duration": 0})
     set_status(jd, "live", 0, "Starting")
     return jd
@@ -296,6 +297,9 @@ def run(key):
     rec = Recorder(job["url"], jd / "buffer", jd / "record.log")
     deadline = t0 + float(job.get("hours") or 6) * 3600
     clips, why_stop = [], "Stopped"
+    basis = job.get("basis") or ["chat"]
+    listen = "audio" in basis or "speech" in basis
+    scan, heard = None, set()
     write_json(jd / "live.json", {**(read_json(jd / "live.json", {}) or {}), "pid": os.getpid(), "t0": t0})
     try:
         while True:
@@ -308,19 +312,31 @@ def run(key):
             if not rec.alive():
                 why_stop = "The stream ended"
                 break
-            if not chat.alive:
+            if not chat.alive and "chat" in basis:
                 why_stop = chat.error or "Chat ended"
                 break
             elapsed = time.time() - t0
             msgs = chat.snapshot()
-            _publish(jd, meta, job, msgs, elapsed, clips, chat.error)
-            if elapsed < WARMUP_S or len(msgs) < 10:
+            if listen:                                     # loudness (+ words) of every finished segment, in order
+                segs = rec.segments()
+                for w, f in segs[:-1]:
+                    if f.name in heard:
+                        continue
+                    if scan is None:
+                        scan = signals.AudioScan(speech="speech" in basis, t0=max(0.0, w - t0))
+                        scan.db = [-90.0] * int(max(0.0, w - t0) // signals.BIN)
+                    scan.feed(signals.segment_audio(f))
+                    heard.add(f.name)
+            _publish(jd, meta, job, msgs, elapsed, clips, chat.error, scan)
+            if elapsed < WARMUP_S or ("chat" in basis and len(msgs) < 10) or (listen and not scan):
                 set_status(jd, "live", 0, f"Watching for {fmt_t(elapsed)}. Learning this chat's normal pace before "
                                           f"clipping ({len(msgs)} messages so far)")
                 continue
-            res = spikes.analyse(msgs, elapsed, top_n=200)
+            res = signals.find(basis, elapsed, msgs=msgs, db=scan.db if scan else None,
+                               words=scan.words if scan else None, keywords=job.get("keywords", ""), top_n=200)
             for c in sorted(res["clips"], key=lambda c: c["chat_peak"]):
-                if any(abs(c["chat_peak"] - k["chat_peak"]) < spikes.DEDUPE for k in clips):
+                at = c.get("peak", c["chat_peak"])
+                if any(abs(at - k.get("peak", k["chat_peak"])) < spikes.DEDUPE for k in clips):
                     continue
                 if c["end"] + SETTLE_S > elapsed:
                     continue                                   # chat hasn't calmed down yet, or not recorded yet
@@ -341,7 +357,7 @@ def run(key):
                 except Exception as e:
                     (cd / "error.log").write_text(str(e))
                     clips.append({**c, "failed": str(e)})
-                _publish(jd, meta, job, msgs, elapsed, clips, chat.error)
+                _publish(jd, meta, job, msgs, elapsed, clips, chat.error, scan)
             rec.prune(t0 + elapsed - BUFFER_S)
             n = len([c for c in clips if not c.get("failed")])
             set_status(jd, "live", 0, f"Watching for {fmt_t(elapsed)}. {n} clip{'' if n == 1 else 's'} so far"
@@ -350,7 +366,7 @@ def run(key):
         stop_evt.set()
         rec.close()
         msgs = chat.snapshot()
-        _publish(jd, meta, job, msgs, time.time() - t0, clips, "")
+        _publish(jd, meta, job, msgs, time.time() - t0, clips, "", scan)
         for f in (jd / "buffer").glob("*"):
             f.unlink(missing_ok=True)
         try:
@@ -365,9 +381,13 @@ def run(key):
         set_status(jd, "done", 100, f"{why_stop}. {n} clip{'' if n == 1 else 's'} from {fmt_t(time.time() - t0)} of watching")
 
 
-def _publish(jd, meta, job, msgs, elapsed, clips, note):
+def _publish(jd, meta, job, msgs, elapsed, clips, note, scan=None):
     """Chart, ranked list and chat for the dashboard. Keeps notes /clip wrote."""
     write_json(jd / "chat.json", msgs)
+    if scan is not None:
+        write_json(jd / "signals.json", {"bin": signals.BIN, "db": scan.db})
+        if scan.speech:
+            write_json(jd / "transcript.json", scan.words)
     counts = [0] * max(1, int(elapsed // spikes.BIN) + 1)
     for m in msgs:
         counts[min(len(counts) - 1, int(m["t"] // spikes.BIN))] += 1
@@ -384,4 +404,4 @@ def _publish(jd, meta, job, msgs, elapsed, clips, note):
     write_json(jd / "clips.json", {"url": job["url"], "platform": job["platform"], "id": job["id"], "live": True,
                                    "title": meta.get("title"), "channel": meta.get("channel"), "duration": round(elapsed),
                                    "messages": len(msgs), "avg_per_min": round(avg * 60 / spikes.BIN, 2),
-                                   "bin": spikes.BIN, "clips": good})
+                                   "bin": spikes.BIN, "basis": job.get("basis") or ["chat"], "clips": good})

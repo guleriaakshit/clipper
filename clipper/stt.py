@@ -59,12 +59,20 @@ def _recognizer():
 
 def words(path):
     """[{"text", "start", "end"}] in seconds for one audio/video file."""
-    import numpy as np
     if not available():
         raise RuntimeError("No speech-to-text model installed. Run `clipper stt-download` to add subtitles.")
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
                          capture_output=True, check=True).stdout
-    x = np.frombuffer(raw, np.float32)
+    import numpy as np
+    return words_from_array(np.frombuffer(raw, np.float32))
+
+
+def words_from_array(x, offset=0.0):
+    """Same, for 16 kHz mono float32 samples; times shifted by offset seconds."""
+    if not available():
+        raise RuntimeError("No speech-to-text model installed. Run `clipper stt-download` first.")
+    if len(x) < 1600:
+        return []
     r = _recognizer()
     s = r.create_stream()
     s.accept_waveform(16000, x)
@@ -73,11 +81,11 @@ def words(path):
     for tk, t in zip(list(s.result.tokens), list(s.result.timestamps)):
         if tk.startswith("▁") or tk.startswith(" "):
             if cur:
-                out.append({"text": cur, "start": t0, "end": t})
+                out.append({"text": cur, "start": round(offset + t0, 3), "end": round(offset + t, 3)})
             cur, t0 = tk.lstrip("▁ "), t
         else:
             cur += tk
         last = t
     if cur:
-        out.append({"text": cur, "start": t0, "end": last + 0.25})
+        out.append({"text": cur, "start": round(offset + t0, 3), "end": round(offset + last + 0.25, 3)})
     return out

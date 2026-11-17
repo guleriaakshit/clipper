@@ -1,5 +1,6 @@
-"""clipper analyze <url> [--top 10] [--cookies-from-browser chrome] [--chat-file f.json] [--no-download]
-clipper live <twitch channel or live YouTube link> [--hours 6]
+"""clipper analyze <url> [--top 10] [--by chat,audio,speech] [--words "no way,let's go"] [--cookies-from-browser chrome]
+                [--chat-file f.json] [--no-download]
+clipper live <twitch channel or live YouTube link> [--hours 6] [--by chat,audio,speech] [--words ...]
 clipper stop <job-key>
 clipper serve [--port 8765]
 clipper render <job-key> <clip-n>
@@ -21,6 +22,8 @@ def main():
     a.add_argument("--cookies-from-browser", default=None)
     a.add_argument("--chat-file", default=None)
     a.add_argument("--no-download", action="store_true")
+    a.add_argument("--by", default="chat", help="comma list of chat, audio, speech (default chat)")
+    a.add_argument("--words", default="", help="words to listen for, comma separated (with --by speech)")
     s = sub.add_parser("serve")
     s.add_argument("--port", type=int, default=8765)
     r = sub.add_parser("render")
@@ -30,6 +33,8 @@ def main():
     lv = sub.add_parser("live")
     lv.add_argument("url")
     lv.add_argument("--hours", type=float, default=6.0)
+    lv.add_argument("--by", default="chat")
+    lv.add_argument("--words", default="")
     lr = sub.add_parser("live-run")
     lr.add_argument("key")
     st = sub.add_parser("stop")
@@ -40,11 +45,12 @@ def main():
     if args.cmd == "analyze":
         from .pipeline import analyze
         jd = analyze(args.url, top_n=args.top, cookies_browser=args.cookies_from_browser,
-                     chat_file=args.chat_file, skip_download=args.no_download)
+                     chat_file=args.chat_file, skip_download=args.no_download,
+                     basis=args.by.split(","), keywords=args.words)
         c = read_json(jd / "clips.json")
         print(f"job: {jd.name}  messages: {c['messages']}  average: {c['avg_per_min']}/min")
         for x in c["clips"]:
-            print(f"  #{x['id']}  score {x['score']:>3}  {x['multiple']}x  at {x['vod_time']}  {x['auto_reason'][:90]}")
+            print(f"  #{x['id']}  score {x['score']:>3}  {'+'.join(x.get('basis', ['chat']))}  at {x['vod_time']}  {x['auto_reason'][:90]}")
     elif args.cmd == "serve":
         from .app import serve
         print(f"Clipper dashboard: http://localhost:{args.port}")
@@ -57,7 +63,7 @@ def main():
         target = live.probe(args.url)
         if not target:
             raise SystemExit("That link isn't live right now. For a past stream use: clipper analyze <url>")
-        jd = live.new_job(target, hours=args.hours)
+        jd = live.new_job(target, hours=args.hours, basis=args.by.split(","), keywords=args.words)
         print(f"Watching {target['channel']} live. Job: {jd.name}. Ctrl+C or `clipper stop {jd.name}` to stop.")
         try:
             live.run(jd.name)
