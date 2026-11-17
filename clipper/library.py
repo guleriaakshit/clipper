@@ -1,0 +1,98 @@
+"""Delete streams and clips. Deleted files go to the system Trash (recoverable) when there is one, else they are
+removed. Remotion's hard links (remotion/public/clips/<job>-<n>.mp4) are removed with them."""
+import os
+import shutil
+import time
+from pathlib import Path
+
+from .common import JOBS, REMOTION, read_json, write_json
+
+TRASH = Path.home() / ".Trash"
+
+
+def size_of(p: Path) -> int:
+    if p.is_file():
+        return p.stat().st_size
+    total = 0
+    for root, _, files in os.walk(p):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def human(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def busy(key: str) -> str:
+    """Why this stream can't be deleted right now, or ''."""
+    jd = JOBS / key
+    from . import live
+    if live.running(jd):
+        return "it's being watched live (stop it first)"
+    st = read_json(jd / "status.json", {}) or {}
+    if st.get("stage") not in (None, "", "done", "error") and not (read_json(jd / "job.json", {}) or {}).get("live"):
+        if time.time() - (jd / "status.json").stat().st_mtime < 600:
+            return "it's still being analysed"
+    return ""
+
+
+def _discard(p: Path, label: str):
+    if not p.exists():
+        return
+    if TRASH.is_dir() and os.access(TRASH, os.W_OK):
+        dest = TRASH / f"{label} {time.strftime('%H.%M.%S')}"
+        shutil.move(str(p), str(dest))
+    elif p.is_dir():
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+
+
+def _unlink_public(key: str, n=None):
+    pub = REMOTION / "public" / "clips"
+    for f in pub.glob(f"{key}-{n if n is not None else '*'}.mp4"):
+        f.unlink(missing_ok=True)
+
+
+def delete_streams(keys):
+    done, skipped = [], []
+    for k in keys:
+        jd = JOBS / k
+        if not jd.is_dir() or jd.parent != JOBS:
+            continue
+        why = busy(k)
+        if why:
+            skipped.append((k, why))
+            continue
+        _unlink_public(k)
+        _discard(jd, f"Clipper stream {k}")
+        done.append(k)
+    return done, skipped
+
+
+def delete_clips(key: str, ids):
+    jd = JOBS / key
+    why = busy(key)
+    if why:
+        return [], [(i, why) for i in ids]
+    ids = {int(i) for i in ids}
+    done = []
+    for n in sorted(ids):
+        cd = jd / "clips" / str(n)
+        _unlink_public(key, n)
+        if cd.exists():
+            _discard(cd, f"Clipper {key} clip {n}")
+        done.append(n)
+    c = read_json(jd / "clips.json")
+    if c:
+        c["clips"] = [x for x in c.get("clips", []) if x["id"] not in ids]
+        write_json(jd / "clips.json", c)
+    return done, []

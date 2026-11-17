@@ -1,0 +1,15 @@
+# local data and caches
+jobs/
+tmp/
+models/
+config.json
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+bin/
+remotion/node_modules/
+remotion/public/clips/
+remotion/out/
+# personal notes
+CLAUDE.md

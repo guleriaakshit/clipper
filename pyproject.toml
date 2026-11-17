@@ -1,0 +1,28 @@
+[project]
+name = "clipper"
+version = "1.0.0"
+description = "Find where chat spiked in a Twitch, YouTube or Kick stream (past or live) and cut those moments into vertical Shorts."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "gradio==6.32.0",
+    "numpy>=2.0",
+    "opencv-python-headless>=4.10",
+    "pillow>=10.1",
+    "websockets>=13",
+    "yt-dlp>=2025.1.1",
+]
+
+[project.optional-dependencies]
+stt = ["sherpa-onnx>=1.12"]
+
+[project.scripts]
+clipper = "clipper.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["clipper", "clipper.chat"]
