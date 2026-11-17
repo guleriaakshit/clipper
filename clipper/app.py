@@ -90,8 +90,9 @@ def status_html(key):
                 f'<p>{esc(st.get("msg") or "")}</p></div></div>')
     stats = []
     basis = s.get("basis") or ["chat"]
-    if basis != ["chat"]:
-        stats.append(("Found by", "<span class='np-by'>" + ", ".join(signals.NAMES[x] for x in basis) + "</span>"))
+    stats.append(("Looked for", "<span class='np-by'>" + " + ".join(signals.NAMES[x] for x in basis) + "</span>"))
+    if s.get("min_score") is not None:
+        stats.append(("Minimum score", str(s["min_score"])))
     if s.get("messages"):
         stats.append(("Chat messages", f"{s['messages']:,}"))
     if s.get("avg_per_min") is not None:
@@ -101,6 +102,14 @@ def status_html(key):
     stats.append(("Clips found", str(len(s.get("clips", [])))))
     dl = "".join(f"<div><dt>{a}</dt><dd>{b}</dd></div>" for a, b in stats)
     notes = "".join(f'<p class="np-livemsg">{esc(n)}</p>' for n in s.get("notes") or [])
+    b = s.get("below")
+    if b and not s.get("clips"):
+        notes += (f'<div class="np-note">No clip scored {s.get("min_score")} or more. The best moment scored '
+                  f'<b>{b["score"]}</b> at {fmt_t(b["start"])} (found by {" + ".join(signals.NAMES[x] for x in b["basis"])}). '
+                  f'Lower the minimum score and press Find clips again to get it.</div>')
+    elif b:
+        notes += (f'<p class="np-livemsg">{b["count"]} weaker moment{"" if b["count"] == 1 else "s"} left out '
+                  f'(below {s.get("min_score")}).</p>')
     return f'<div class="np-status">{head}<dl class="np-stats">{dl}</dl>{notes}</div>'
 
 
@@ -246,7 +255,9 @@ def list_html(key, sel=None):
 
 
 def _basis_tags(c):
-    return "".join(f'<span class="by by-{b}">{signals.NAMES[b]}</span>' for b in c.get("basis", ["chat"]))
+    tags = '<span class="by-plus">+</span>'.join(f'<span class="by by-{b}">{signals.NAMES[b]}</span>'
+                                                  for b in c.get("basis", ["chat"]))
+    return f'<span class="by-line"><span class="by-label">Found by</span>{tags}</span>'
 
 
 def _row_facts(c):
@@ -328,6 +339,8 @@ def card_html(key, n, note=""):
   <div class="np-card-top">
     <div class="np-score"><b>{c['score']}</b><span>/100</span></div>
     <div><p class="mult">{headline}</p><p class="muted">Clip {c['id']}</p></div>
+  </div>
+  <div class="np-foundby">{_basis_tags(c)}
   </div>
   <h4>Score by signal</h4><div class="chips">{subs}</div>
   <dl class="np-facts">{dl}</dl>
@@ -425,7 +438,7 @@ def boxes(frame, e):
 
 
 # ---------------- actions ----------------
-def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
+def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords, min_score):
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or [])]
     if not basis:
         raise gr.Error("Pick at least one way to find clips: chat spikes, loud voice or what's said.")
@@ -441,7 +454,8 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
     if not target and basis == ["audio"]:
         raise gr.Error("Loud voice works on live streams only. For a past stream, pick chat spikes or what's said.")
     if target:
-        jd = live.new_job(target, hours=float(hours or 6), basis=basis, keywords=keywords or "")
+        jd = live.new_job(target, hours=float(hours or 6), basis=basis, keywords=keywords or "",
+                          min_score=int(min_score))
         live.start_process(jd)
         gr.Info(f"Watching {target.get('channel') or target['id']} live. Clips appear as chat spikes.")
         return jd.name
@@ -465,7 +479,7 @@ def start_analysis(url, top_n, cookies, chat_file, hours, basis, keywords):
         with LOCK:
             try:
                 pipeline.analyze(url, top_n=int(top_n), cookies_browser=cookies or None, chat_file=cf, basis=basis,
-                                 keywords=keywords or "")
+                                 keywords=keywords or "", min_score=int(min_score))
             except Exception:
                 pass                       # the error is in status.json
     threading.Thread(target=work, daemon=True).start()
@@ -1013,6 +1027,12 @@ label.np-tick { display: grid; place-items: center; width: 36px; min-height: 36p
 .by-audio { background: #E6EEFB; color: #2D5BB9; }
 .by-speech { background: #EFE8FB; color: #6A3FB5; }
 .chip.sc b { color: var(--heat); margin: 0 2px 0 0; }
+.by-line { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-right: 8px; }
+.by-line .by { margin-right: 0; }
+.by-label { font-size: 12px; color: var(--muted); margin-right: 2px; }
+.by-plus { font-size: 12px; color: var(--muted); }
+.np-open .facts .by-line { flex-basis: 100%; margin-bottom: 2px; }
+.np-foundby { padding: 12px 0 0; }
 .chip.said { background: #EFE8FB; border-color: #DCCDF5; }
 
 /* ---------- tabs ---------- */
@@ -1167,6 +1187,9 @@ def build():
                                               "and are never listened to. Live streams are listened to on your computer.")
                 keywords = gr.Textbox(label="Words to listen for (optional)", visible=False, elem_id="np-words",
                                       placeholder="no way, let's go, clip that", lines=1, max_lines=2)
+                min_score = gr.Slider(0, 100, value=85, step=1, label="Minimum score",
+                                      info="Clips scoring lower are left out, so you only get strong ones.",
+                                      elem_id="np-minscore")
                 go = gr.Button("Find clips", variant="primary", elem_id="np-go")
                 with gr.Accordion("More options", open=False, elem_id="np-opts"):
                     top_n = gr.Slider(1, 30, value=10, step=1, label="How many clips to keep (past streams)")
@@ -1311,7 +1334,7 @@ def build():
 
         # streams
         basis.change(lambda b: gr.update(visible="speech" in (b or [])), basis, keywords, **quiet)
-        go.click(start_analysis, [url, top_n, cookies, chat_file, hours, basis, keywords], job).then(
+        go.click(start_analysis, [url, top_n, cookies, chat_file, hours, basis, keywords, min_score], job).then(
             lambda k: refresh_job(k), job, head_out, **quiet)
         job.change(switch_job, job, head_out, **quiet)
         demo.load(first_load, job, head_out, **quiet)

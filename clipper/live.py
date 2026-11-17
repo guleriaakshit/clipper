@@ -76,13 +76,14 @@ def probe(url):
     return None
 
 
-def new_job(target, hours=6.0, top_n=30, basis=("chat",), keywords=""):
+def new_job(target, hours=6.0, top_n=30, basis=("chat",), keywords="", min_score=85):
     key = f"{target['platform']}-live-{re.sub(r'[^A-Za-z0-9_-]', '', target['id'])}-{time.strftime('%Y%m%d-%H%M%S')}"
     jd = JOBS / key
     jd.mkdir(parents=True)
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or ())] or ["chat"]
     write_json(jd / "job.json", {"url": target["url"], "platform": target["platform"], "id": target["id"], "live": True,
-                                 "hours": hours, "top_n": top_n, "basis": basis, "keywords": keywords})
+                                 "hours": hours, "top_n": top_n, "basis": basis, "keywords": keywords,
+                                 "min_score": min_score})
     write_json(jd / "meta.json", {"title": target.get("title"), "channel": target.get("channel"), "duration": 0})
     set_status(jd, "live", 0, "Starting")
     return jd
@@ -333,7 +334,8 @@ def run(key):
                                           f"clipping ({len(msgs)} messages so far)")
                 continue
             res = signals.find(basis, elapsed, msgs=msgs, db=scan.db if scan else None,
-                               words=scan.words if scan else None, keywords=job.get("keywords", ""), top_n=200)
+                               words=scan.words if scan else None, keywords=job.get("keywords", ""), top_n=200,
+                               min_score=job.get("min_score", 0))
             for c in sorted(res["clips"], key=lambda c: c["chat_peak"]):
                 at = c.get("peak", c["chat_peak"])
                 if any(abs(at - k.get("peak", k["chat_peak"])) < spikes.DEDUPE for k in clips):
@@ -404,4 +406,5 @@ def _publish(jd, meta, job, msgs, elapsed, clips, note, scan=None):
     write_json(jd / "clips.json", {"url": job["url"], "platform": job["platform"], "id": job["id"], "live": True,
                                    "title": meta.get("title"), "channel": meta.get("channel"), "duration": round(elapsed),
                                    "messages": len(msgs), "avg_per_min": round(avg * 60 / spikes.BIN, 2),
-                                   "bin": spikes.BIN, "basis": job.get("basis") or ["chat"], "clips": good})
+                                   "bin": spikes.BIN, "basis": job.get("basis") or ["chat"],
+                                   "min_score": job.get("min_score", 0), "clips": good})

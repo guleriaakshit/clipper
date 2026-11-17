@@ -145,13 +145,30 @@ def speech_excite(words, n, keywords=""):
 
 
 # ---------------- moments ----------------
-def find(enabled, duration, msgs=None, db=None, words=None, keywords="", top_n=10):
+def find(enabled, duration, msgs=None, db=None, words=None, keywords="", top_n=10, min_score=0):
+    """Moments scoring at least min_score, best first. res["below"] = the best one that didn't make it."""
     enabled = [s for s in ("chat", "audio", "speech") if s in (enabled or [])] or ["chat"]
     if enabled == ["chat"]:
-        res = spikes.analyse(msgs, duration, top_n=top_n)
+        res = spikes.analyse(msgs, duration, top_n=10_000)
         for c in res["clips"]:
             c["basis"], c["sub"], c["said"], c["hot_ref"] = ["chat"], {"chat": c["score"]}, [], c["chat_peak"]
-        return res
+        return _keep(res, min_score, top_n)
+    return _keep(_find(enabled, duration, msgs, db, words, keywords), min_score, top_n)
+
+
+def _keep(res, min_score, top_n):
+    good = [c for c in res["clips"] if c["score"] >= min_score]
+    bad = [c for c in res["clips"] if c["score"] < min_score]
+    res["below"] = ({"score": bad[0]["score"], "start": bad[0]["start"], "basis": bad[0]["basis"], "count": len(bad)}
+                    if bad else None)
+    res["clips"] = good[:top_n]
+    for i, c in enumerate(res["clips"], 1):
+        c["id"] = i
+    res["min_score"] = min_score
+    return res
+
+
+def _find(enabled, duration, msgs, db, words, keywords):
     n = int(np.ceil(duration / BIN)) or 1
     E, T, said = {}, {}, [[] for _ in range(n)]
     if "chat" in enabled and msgs:
@@ -188,8 +205,7 @@ def find(enabled, duration, msgs=None, db=None, words=None, keywords="", top_n=1
     for c in cands:
         if all(abs(c["peak"] - k["peak"]) >= spikes.DEDUPE for k in kept):
             kept.append(c)
-        if len(kept) >= top_n:
-            break
+
     counts, smooth, avg = spikes.rate(msgs, duration) if msgs else (np.zeros(n), np.zeros(n), 0.0)
     times = np.array([m["t"] for m in msgs]) if msgs else np.zeros(0)
     for i, c in enumerate(kept, 1):

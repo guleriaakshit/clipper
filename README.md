@@ -10,7 +10,7 @@ You choose how clips are found, one way or several at once:
 - **What's said:** reaction phrases ("no way", "oh my god", "let's go"…) and any words you give it. Past streams use YouTube's own auto-generated subtitles, so nothing is listened to or transcribed. Twitch and Kick VODs have no subtitles, so this option isn't available for them. Live streams are transcribed on your computer (needs the speech-to-text model).
 - **Streamer gets loud** (live streams only): the streamer's voice goes at least 6 dB above their usual level over the last 10 minutes.
 
-Each moment gets a score out of 100, and moments where several signals agree rank higher. The dashboard shows which signal found each clip.
+Each moment gets a score out of 100, and moments where several signals agree rank higher. Only clips at or above the **minimum score** (85 by default) are kept, so you don't get weak ones; if nothing makes it, Clipper tells you the best score it found. Every clip shows which combination of signals found it (for example *Chat spikes + What's said*).
 
 The dashboard runs on your own computer:
 
@@ -43,7 +43,7 @@ To install without questions, add `--yes` (`... | bash -s -- --yes`). To update,
 ```sh
 clipper serve                                   # dashboard at http://localhost:8765
 clipper analyze https://www.twitch.tv/videos/…  # a past stream, found by chat spikes
-clipper analyze <link> --by chat,speech --words "no way,clip that"   # chat and what's said (YouTube subtitles)
+clipper analyze <link> --by chat,speech --words "no way,clip that" --min-score 80   # chat + what's said, keep 80+
 clipper live https://www.twitch.tv/somechannel  # a stream that's live now (Ctrl+C or `clipper stop <job>` to stop)
 clipper render <job> <clip number>              # render a Short from the terminal
 clipper list                                    # every stream you've clipped

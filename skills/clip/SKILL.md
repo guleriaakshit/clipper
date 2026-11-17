@@ -10,7 +10,7 @@ Clipper is installed where the `clipper` command points (`readlink -f "$(command
 1. **Check it's installed**: `command -v clipper || echo missing`. If missing, tell the user to run the installer:
    `curl -fsSL https://raw.githubusercontent.com/guleriaakshit/clipper/main/install.sh | bash` and stop.
 2. **Start the job** (in the background, it can take a while):
-   - Past stream: `clipper analyze "<url>" --top <N, default 10>`. Ask what to clip on if the user hasn't said: `--by chat` (default), `speech` (what's said, from YouTube's own subtitles; Twitch/Kick VODs have none), `audio` (streamer gets loud, live streams only), or a mix like `--by chat,audio`; `--words "no way,clip that"` adds phrases to listen for.
+   - Past stream: `clipper analyze "<url>" --top <N, default 10>`. Ask what to clip on if the user hasn't said: `--by chat` (default), `speech` (what's said, from YouTube's own subtitles; Twitch/Kick VODs have none), `audio` (streamer gets loud, live streams only), or a mix like `--by chat,audio`; `--words "no way,clip that"` adds phrases to listen for. `--min-score <0-100, default 85>` keeps only strong clips; if none pass, report the best score Clipper found and offer to lower it.
      Kick VODs need an exported chat file (`--chat-file <path>`): Kick's chat API sits behind Cloudflare's bot check. Members-only or age-gated videos: add `--cookies-from-browser chrome` (ask which browser).
    - Live now (a `twitch.tv/<channel>` link or a live YouTube link): `clipper live "<url>" --hours <how long, default 6>`. Clips appear as chat spikes calm down; stop with `clipper stop <job>`.
    - Start the dashboard too: `clipper serve` (background) and give the user http://localhost:8765.

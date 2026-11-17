@@ -9,16 +9,17 @@ from .platforms import detect
 PLATFORM_NAME = {"twitch": "Twitch", "youtube": "YouTube", "kick": "Kick"}
 
 
-def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=False, basis=("chat",), keywords=""):
+def analyze(url, top_n=10, cookies_browser=None, chat_file=None, skip_download=False, basis=("chat",), keywords="",
+            min_score=85):
     """basis: any of "chat", "audio", "speech" (see signals.py)."""
     platform, vid = detect(url)
     jd = job_dir(platform, vid)
     basis = [b for b in ("chat", "audio", "speech") if b in (basis or ())] or ["chat"]
     write_json(jd / "job.json", {"url": url, "platform": platform, "id": vid, "cookies_browser": cookies_browser,
-                                 "basis": basis, "keywords": keywords})
+                                 "basis": basis, "keywords": keywords, "min_score": min_score})
     (jd / "stop").unlink(missing_ok=True)
     try:
-        _run(url, platform, vid, jd, top_n, cookies_browser, chat_file, skip_download, basis, keywords)
+        _run(url, platform, vid, jd, top_n, cookies_browser, chat_file, skip_download, basis, keywords, min_score)
     except Exception as e:
         set_status(jd, "error", 0, "", f"{e}")
         (jd / "error.log").write_text(traceback.format_exc())
@@ -37,7 +38,7 @@ def _step(jd, stage, pct, msg=""):
     set_status(jd, stage, pct, msg)
 
 
-def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_download, basis, keywords):
+def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_download, basis, keywords, min_score):
     prog = lambda pct, msg: _step(jd, "chat", pct, msg)
     msgs = []
     if (jd / "chat.json").exists() and not chat_file:
@@ -76,7 +77,8 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
     _step(jd, "spikes", 32, f"Finding moments by {names}")
     if "chat" in basis and not msgs:
         raise RuntimeError("No chat to find spikes in. Untick chat spikes or add a chat file.")
-    res = signals.find(basis, meta["duration"], msgs=msgs, db=db, words=words, keywords=keywords, top_n=top_n)
+    res = signals.find(basis, meta["duration"], msgs=msgs, db=db, words=words, keywords=keywords, top_n=top_n,
+                       min_score=min_score)
     old = {c["id"]: c for c in (read_json(jd / "clips.json", {}) or {}).get("clips", [])}
     for c in res["clips"]:
         c["vod_time"] = fmt_t(c["start"])
@@ -87,14 +89,17 @@ def _run(url, platform, vid, jd: Path, top_n, cookies_browser, chat_file, skip_d
             c["what"], c["why"] = "", ""
     summary = {"url": url, "platform": platform, "id": vid, "title": meta.get("title"), "channel": meta.get("channel"),
                "duration": meta["duration"], "messages": len(msgs), "avg_per_min": res.get("avg_per_min", 0),
-               "bin": res["bin"], "basis": basis, "keywords": keywords, "notes": notes, "clips": res["clips"]}
+               "bin": res["bin"], "basis": basis, "keywords": keywords, "notes": notes, "min_score": min_score,
+               "below": res.get("below"), "clips": res["clips"]}
     if msgs:
         write_json(jd / "rates.json", {"bin": res["bin"], "avg": res["avg"], "counts": res["counts"]})
     else:
         (jd / "rates.json").unlink(missing_ok=True)
     write_json(jd / "clips.json", summary)
     if not res["clips"]:
-        set_status(jd, "done", 100, f"No moments found by {names} in this stream.")
+        b = res.get("below")
+        set_status(jd, "done", 100, (f"No clip scored {min_score} or more. The best was {b['score']} at {fmt_t(b['start'])}. "
+                                     f"Lower the minimum score to get it.") if b else f"No moments found by {names} in this stream.")
         return
     if skip_download:
         set_status(jd, "done", 100, "Spikes found (download skipped)")
